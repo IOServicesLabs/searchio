@@ -7,6 +7,10 @@ name: image
 on:
   push:
     branches: [main]
+    # Docs/markdown can't change the image; don't spend a build on them.
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
     tags: ["v*"]
 
 env:
@@ -22,6 +26,9 @@ permissions:
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    # A warm-cache build is ~2-3 min; past 30 the engine clone or a layer is
+    # hung, and without a cap it bills to the 6-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
