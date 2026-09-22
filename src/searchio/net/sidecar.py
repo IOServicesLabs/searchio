@@ -844,6 +844,27 @@ class SidecarClient:
         self._ua = ua.strip() if isinstance(ua, str) else ""
         return self._ua
 
+    async def storage_state_get(self) -> dict:
+        """The session as a Playwright storage_state artifact (cookies +
+        origins). Both backends speak the verb, but its scope differs: the
+        engine exports the whole session jar, the patchright sidecar the
+        whole context -- callers must scope what they take (sessions.py
+        filters to the site's own cookies before anything is written back)."""
+        r = await self.call("storage_state_get", {})
+        state = r.get("storage_state")
+        return state if isinstance(state, dict) else {}
+
+    async def storage_state_set(self, state: dict) -> bool:
+        """Inject a storage_state artifact into the live jar (both backends).
+
+        This is the sanctioned browser-tier session path (contract SESSIONS.md
+        3.3 step 3): cookie records are added to the context verbatim;
+        ``origins`` stays ``[]`` because the platform captures cookies only,
+        never localStorage. A False/raise here never fails the fetch -- the
+        pass just runs anonymous, exactly like an unset sessions dir."""
+        r = await self.call("storage_state_set", {"storage_state": state})
+        return bool(r.get("ok"))
+
     async def discover_api(self, url: str, *, actions: list | None = None, save: bool = True) -> dict:
         """Learn a site's own JSON API by driving its UI and watching XHR.
 

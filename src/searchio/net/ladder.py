@@ -82,6 +82,7 @@ from .clearance import (
 from .profiles import DomainStore
 from .ratelimit import DomainLimiter
 from .robots import RobotsCache
+from .sessions import SessionStore, SiteSession
 from .sidecar import SidecarClient, default_engine_path
 
 TIER_NAMES = {0: "http", 1: "impersonate", 2: "browser"}
@@ -618,6 +619,10 @@ class Ladder:
         self.clearance = ClearanceStore(
             self.s.clearance_path(), self.s.clearance_enabled, self.s.clearance_ttl_s
         )
+        # Seeded browser sessions (docs/SESSIONS.md): the platform's login
+        # jars. An unset sessions_dir is a store that always misses -- nothing
+        # in searchio changes behaviour until the directory exists.
+        self.sessions = SessionStore(self.s.sessions_dir, self.s.state_dir)
         self.limiter = DomainLimiter(
             rps=self.s.per_domain_rps,
             burst=self.s.per_domain_burst,
@@ -855,6 +860,15 @@ class Ladder:
         #: PDF extraction fires at most once per fetch -- every tier downloads
         #: the same bytes, so a failed extract is terminal, not climb-worthy.
         pdf_tried = False
+        #: Seeded sessions (docs/SESSIONS.md): the site's jar, resolved once
+        #: per fetch. A file deleted mid-climb simply stops matching on the
+        #: next fetch (acceptance 5).
+        sess0: SiteSession | None = self.sessions.for_host(dom)
+        #: The session retry fires at most once per fetch and only on a wall:
+        #: the anonymous attempt's bookkeeping (clearance drop, record_block)
+        #: always runs first, then the SAME tier runs again with the jar.
+        session_retried = False
+        session: SiteSession | None = None
         #: Whether the current tier-2 pass (if tier 2 is where we are) goes
         #: through the challenge sidecar instead of the primary one.
         rendered_pass = bool(rendered) or opener
@@ -874,7 +888,11 @@ class Ladder:
             attempt_started = time.time()
             async with self.limiter.slot():
                 try:
-                    res = await self._try_tier(tier, url, referer=referer, rendered=rendered_pass)
+                    # The session kwarg only exists once a wall set it: five
+                    # test suites override _try_tier with the old narrow
+                    # signature, and none of them needs to know about jars.
+                    sess_kw = {"session": session} if session is not None else {}
+                    res = await self._try_tier(tier, url, referer=referer, rendered=rendered_pass, **sess_kw)
                 except TargetRefused:
                     # A policy refusal is PERMANENT: no tier can fetch a
                     # refused target, so retrying and climbing are both
@@ -914,7 +932,8 @@ class Ladder:
                     # only answers the browser: force_tier/rendered=True.
                     last_transient = exc
                     try:
-                        res = await self._try_tier(tier, url, referer=referer, rendered=rendered_pass)
+                        sess_kw = {"session": session} if session is not None else {}
+                        res = await self._try_tier(tier, url, referer=referer, rendered=rendered_pass, **sess_kw)
                     except TransientError as exc2:
                         last_transient = exc2
                         escalations.append(f"tier{tier}:transient")
@@ -983,7 +1002,10 @@ class Ladder:
                         escalations=escalations + [f"tier{tier}:{verdict.reason}", stamp],
                         rendered=False,
                     )
-                    if use_cache:
+                    # A jar ever attached means this body was read as a
+                    # logged-in identity: private page, never shared-cache
+                    # material (bug 138's shape, one tier up).
+                    if use_cache and session is None:
                         self.cache.put(url, out.model_dump(exclude={"from_cache"}),
                                        variant=self._cache_variant(rendered), tier=tier)
                     return out
@@ -1032,7 +1054,10 @@ class Ladder:
                     escalations=escalations,
                     rendered=served_rendered,
                 )
-                if use_cache:
+                # A jar ever attached means this body was read as a logged-in
+                # identity: private page, never shared-cache material (bug
+                # 138's shape, one tier up).
+                if use_cache and session is None:
                     self.cache.put(url, out.model_dump(exclude={"from_cache"}),
                                    variant=self._cache_variant(rendered), tier=tier)
                 return out
@@ -1130,6 +1155,30 @@ class Ladder:
                     best = (status, headers, body, ctype, final_url, tier, verdict.reason,
                             rendered_pass and tier == 2)
 
+            # Seeded-session retry (docs/SESSIONS.md 3.3): the anonymous
+            # attempt hit a wall and a jar exists for this host, so the SAME
+            # tier runs again with the jar before any escalation. A logged-in
+            # read that still costs a Chromium launch throws away the reason
+            # searchio is fast; the cheap tiers carry a Cookie header fine.
+            # The trigger is a real block or a login wall: classify stamps
+            # 401/402/407 as auth_required_* (non-blocked by design, blocks.py
+            # L302) and a login wall is exactly the case the jar exists for.
+            # 429 throttles and js-shell verdicts never attach an identity.
+            # The bookkeeping above already ran for the anonymous attempt, so
+            # a failed retry still ends in an honest Blocked -- and the climb
+            # then continues to tier 2 with the jar in hand.
+            if (
+                tier < 2
+                and not session_retried
+                and sess0 is not None
+                and (verdict.blocked or verdict.reason.startswith("auth_required"))
+            ):
+                session_retried = True
+                session = sess0
+                escalations.append(f"tier{tier}:session_retry")
+                self._bump("session_retry")
+                continue
+
             advance()
 
         # A block only outranks the thin page when it came from the thin
@@ -1205,6 +1254,7 @@ class Ladder:
         self.cache.close()
         self.profiles.close()
         self.clearance.close()
+        self.sessions.close()
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -1219,12 +1269,22 @@ class Ladder:
     # ── tiers ────────────────────────────────────────────────────────────────
 
     async def _try_tier(
-        self, tier: int, url: str, *, referer: str = "", rendered: bool = False
+        self, tier: int, url: str, *, referer: str = "", rendered: bool = False,
+        session: SiteSession | None = None,
     ) -> tuple[int, dict[str, str], str, str, str]:
+        # The session kwarg reaches a tier ONLY when one is in play: the test
+        # suite's narrow tier overrides (def _tier0(self, url, *, referer=""))
+        # predate the parameter -- the conditional-kwarg rule.
         if tier == 0:
+            if session is not None:
+                return await self._tier0(url, referer=referer, session=session)
             return await self._tier0(url, referer=referer)
         if tier == 1:
+            if session is not None:
+                return await self._tier1(url, referer=referer, session=session)
             return await self._tier1(url, referer=referer)
+        if session is not None:
+            return await self._tier2(url, rendered=rendered, session=session)
         return await self._tier2(url, rendered=rendered)
 
     def _client_for(self, rendered: bool) -> SidecarClient:
@@ -1501,7 +1561,8 @@ class Ladder:
         raise TransientError(
             f"redirect_loop: exceeded {self.s.max_redirects} hops ({url[:100]})")
 
-    async def _tier0(self, url: str, *, referer: str = "") -> tuple[int, dict, str, str, str]:
+    async def _tier0(self, url: str, *, referer: str = "",
+                     session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         """Meta-refresh loop over one-document fetches (iteration 25).
 
         A followed refresh is a client-side redirect: the target passes the
@@ -1510,12 +1571,14 @@ class Ladder:
         final URL exactly like a 302, and exceeding the HTTP redirect budget
         is the same honest redirect_loop. The persona/clearance rebuild per
         hop happens inside _tier0_document -- a cross-domain hop arrives with
-        the NEW domain's headers, never the old entry's credential.
+        the NEW domain's headers, never the old entry's credential. The seeded
+        session (when a wall put one in play) re-evaluates per hop the same
+        way.
         """
         current = url
         ref = referer
         for _meta in range(_META_REFRESH_MAX_HOPS + 1):
-            out = await self._tier0_document(current, referer=ref)
+            out = await self._tier0_document(current, referer=ref, session=session)
             target = _meta_refresh_target(out[0], out[3], out[2], out[4])
             if not target:
                 return out
@@ -1529,14 +1592,20 @@ class Ladder:
             f"redirect_loop: meta-refresh chain exceeded "
             f"{_META_REFRESH_MAX_HOPS} hops ({url[:100]})")
 
-    async def _tier0_document(self, url: str, *, referer: str = "") -> tuple[int, dict, str, str, str]:
+    async def _tier0_document(self, url: str, *, referer: str = "",
+                              session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         """Plain HTTP/2. Honest headers, no impersonation."""
         dom = domain_of(url)
         p = persona_mod.for_domain(dom, session=self.session_id)
         headers = persona_mod.safari_headers_fix(
             p, p.headers(referer=referer, contact=self.s.user_agent_contact)
         )
-        headers = self._clearance_headers(dom, headers, url)
+        if session is not None and self.sessions.attachable(session, url):
+            # A jar-carrying request carries exactly one identity: the jar's
+            # pinned UA, and NO clearance -- see _session_headers.
+            headers = self._session_headers(session, headers, url)
+        else:
+            headers = self._clearance_headers(dom, headers, url)
         try:
             r = await self._open_stream(url, headers, self.s.tier0_timeout_s)
             try:
@@ -1557,6 +1626,17 @@ class Ladder:
                         urlsplit(str(r.url)).hostname or ""),
                     headers.get("User-Agent", ""),
                 )
+                # Rotation write-back (docs/SESSIONS.md 3.5): a response to a
+                # jar-carrying request may rotate the jar's own names. This
+                # stays at the response site because only get_list() reaches
+                # duplicate Set-Cookie -- a headers dict collapses them.
+                if session is not None and self.sessions.attachable(session, str(r.url)):
+                    fin = urlsplit(str(r.url))
+                    if self.sessions.apply_response(
+                            session, r.headers.get_list("set-cookie"),
+                            fin.hostname or "", fin.scheme):
+                        self._bump("session_rotated")
+                        self.sessions.request_writeback(session)
                 return (
                     r.status_code,
                     dict(r.headers),
@@ -1571,7 +1651,8 @@ class Ladder:
         except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPError) as exc:
             raise TransientError(f"tier0 {type(exc).__name__}: {exc}") from exc
 
-    async def _tier1(self, url: str, *, referer: str = "") -> tuple[int, dict, str, str, str]:
+    async def _tier1(self, url: str, *, referer: str = "",
+                     session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         """curl_cffi with a genuine browser TLS + HTTP/2 fingerprint.
 
         The import is local so curl_cffi stays an optional dependency: without
@@ -1622,8 +1703,12 @@ class Ladder:
                 # Clearance goes on last, and its UA pin wins: the cookie is
                 # bound to the browser's UA, so that pairing has to survive
                 # intact even though everything else here defers to the
-                # impersonation target.
-                hdrs = self._clearance_headers(dom, hdrs, doc_url)
+                # impersonation target. A seeded session instead goes on as
+                # the request's ONLY identity -- jar pin, no clearance.
+                if session is not None and self.sessions.attachable(session, doc_url):
+                    hdrs = self._session_headers(session, hdrs, doc_url)
+                else:
+                    hdrs = self._clearance_headers(dom, hdrs, doc_url)
                 current = doc_url
                 r = None
                 for _hop in range(self.s.max_redirects + 1):
@@ -1689,6 +1774,15 @@ class Ladder:
                     self._harvest_trust(
                         str(r.url), jar,
                         hdrs.get("User-Agent") or persona_ua)
+                    # Rotation write-back: same contract as tier 0's, at the
+                    # one place duplicate Set-Cookie headers survive.
+                    if session is not None and self.sessions.attachable(session, str(r.url)):
+                        fin = urlsplit(str(r.url))
+                        if self.sessions.apply_response(
+                                session, r.headers.get_list("set-cookie"),
+                                fin.hostname or "", fin.scheme):
+                            self._bump("session_rotated")
+                            self.sessions.request_writeback(session)
                     ct = r.headers.get("content-type", "")
                     # Same cap contract as tier 0, on the decoded stream: the
                     # wire-length pre-check is only valid unencoded (compressed
@@ -1759,7 +1853,8 @@ class Ladder:
                 raise TransientError(f"tier1 {name}: {exc}") from exc
             raise SearchioError(f"tier1 {name}: {exc}") from exc
 
-    async def _tier2(self, url: str, *, rendered: bool = False) -> tuple[int, dict, str, str, str]:
+    async def _tier2(self, url: str, *, rendered: bool = False,
+                     session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         """A sidecar's browser, with an origin warm-up on refusal.
 
         ``rendered=True`` sends the pass through the challenge sidecar (the
@@ -1777,9 +1872,10 @@ class Ladder:
         the browser on first contact and both succeeded once the profile had
         seen the origin. So on a refusal, navigate the homepage, then ask again.
         """
-        return await self._tier2_via(self._client_for(rendered), url)
+        return await self._tier2_via(self._client_for(rendered), url, session=session)
 
-    async def _tier2_via(self, client: SidecarClient, url: str) -> tuple[int, dict, str, str, str]:
+    async def _tier2_via(self, client: SidecarClient, url: str,
+                         session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         # One budget, caller-owned: a third of the tier budget per navigation
         # attempt. At the 90 s default this is 30000 ms -- patchright's own
         # built-in default, so production behavior is unchanged -- while a
@@ -1792,13 +1888,51 @@ class Ladder:
         # tab -- two callers at once could hand each other's page back. The
         # tab is closed afterwards so neither backend accumulates pages.
         tab_id = f"fetch-{uuid.uuid4().hex[:10]}"
+        # A seeded session rides the browser through the same verb the
+        # handoff flow uses (docs/SESSIONS.md 3.3 step 3). Injection and
+        # write-back both live in the finally below, on whichever client
+        # serves the pass: the challenge sidecar is a DIFFERENT jar than the
+        # primary, so close-time read-back through the primary would read
+        # the wrong browser.
+        injected: SiteSession | None = None
         try:
+            if session is not None:
+                jar_doc = {"cookies": self.sessions.playwright_records(session),
+                           "origins": []}
+                try:
+                    if jar_doc["cookies"] and await client.storage_state_set(jar_doc):
+                        injected = session
+                        self._bump("session_browser_injected")
+                except Exception:  # noqa: BLE001 -- injection never fails a fetch
+                    self._bump("session_browser_inject_error")
             return await self._tier2_on_tab(client, url, tab_id)
         finally:
+            try:
+                if injected is not None:
+                    await self._session_browser_writeback(injected, client)
+            except Exception:  # noqa: BLE001 -- write-back never fails a fetch
+                self._bump("session_browser_writeback_error")
             try:
                 await client.call("close_tab", {"tab_id": tab_id})
             except Exception:  # noqa: BLE001 -- cleanup never fails a fetch
                 pass
+
+    async def _session_browser_writeback(self, sess: SiteSession,
+                                         client: SidecarClient) -> None:
+        """Read the jar back after a tier-2 pass that carried it and write
+        the rotation home (docs/SESSIONS.md 3.5). Runs before close_tab: the
+        tab close does not clear the jar, but the read belongs to the pass.
+        Covers blocked and failed passes alike -- a 403 pass can still rotate
+        or expire cookies, which is what the logged-out guard exists for.
+        """
+        state = await client.storage_state_get()
+        rotated = self.sessions.site_cookies_from_state(sess, state)
+        if rotated != self.sessions.site_records(sess):
+            # The browser jar is ground truth: replace wholesale, new names
+            # included -- unlike the cheap tiers' known-names-only rule.
+            self.sessions.replace_site_records(sess, rotated)
+            self._bump("session_rotated")
+            self.sessions.request_writeback(sess)
 
     async def _tier2_on_tab(
         self, client: SidecarClient, url: str, tab_id: str
@@ -2041,6 +2175,38 @@ class Ladder:
             headers = persona_mod.pin_user_agent(headers, c.user_agent)
         self.clearance.record_use(domain)
         self._bump("clearance_used")
+        return headers
+
+    def _session_headers(self, sess: SiteSession, headers: dict[str, str],
+                         url: str) -> dict[str, str]:
+        """Attach a seeded session jar and pin the site's ONE identity UA
+        (docs/SESSIONS.md 3.4).
+
+        Mutual exclusion with clearance: a jar-carrying request carries
+        exactly one identity. Two UA-bound credential sets cannot share one
+        wire -- cf_clearance under the jar's UA fails at the edge and the
+        jar under the clearance UA inverts the same contradiction -- and the
+        login identity is the reason the retry exists, so it wins. The wall
+        that triggered the retry already dropped the discredited clearance
+        row (bug 143's older_than scoping), so on the immediate retry there
+        is normally no clearance to forgo anyway; challenge/trust cookies
+        earned DURING the session flow are harvested by _harvest_trust under
+        the jar pin, producing coherent clearance rows for later anonymous
+        fetches.
+        """
+        headers = dict(headers)
+        # The persona machinery steps aside for this host: one frozen UA, with
+        # Client Hints rebuilt to agree (bugs 72/73), for every jar-carrying
+        # request -- a jar arriving under a rotating fingerprint reads as
+        # stolen, which is worse than no jar at all.
+        headers = persona_mod.pin_user_agent(headers, self.sessions.pinned_ua(sess))
+        parts = urlsplit(url)
+        jar_header = self.sessions.cookie_header(sess, parts.hostname or "",
+                                                 parts.scheme)
+        if jar_header:
+            existing = headers.get("Cookie")
+            headers["Cookie"] = f"{existing}; {jar_header}" if existing else jar_header
+        self._bump("session_attached")
         return headers
 
     def _harvest_trust(self, url: str, jar: _HopCookies, ua: str) -> None:

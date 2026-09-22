@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     # Clearance cookies earned by the browser, replayed on cheaper tiers.
     clearance_enabled: bool = True
     clearance_ttl_s: int = 1500
+    # Seeded browser sessions: the platform's directory of login jars
+    # (Playwright storage_state + a swarmio block), exported by the cloud.
+    # Empty = disabled: searchio behaves exactly as if sessions did not
+    # exist. When set, a fetch that hits a wall retries at the same tier
+    # with the site's jar and rotated cookies are written to
+    # <dir>/writeback/ for the cloud to re-seal. See docs/SESSIONS.md.
+    sessions_dir: str = ""
 
     # ── Acquisition ladder ───────────────────────────────────────────────────
     # Tier ceiling: 0 plain HTTP, 1 TLS-impersonating HTTP, 2 stealth browser.
