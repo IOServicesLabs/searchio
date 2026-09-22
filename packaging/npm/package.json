@@ -1,0 +1,32 @@
+{
+  "name": "@ioserviceslabs/searchio-mcp",
+  "version": "0.1.0",
+  "description": "searchio MCP server for LLM clients — npx-ready launcher. Runs the all-in-one Docker image when Docker is present, otherwise falls back to a local pip install of searchio.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "searchio-mcp": "./bin/searchio-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "search",
+    "scraping",
+    "llm",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IOServicesLabs/searchio.git",
+    "directory": "packaging/npm"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

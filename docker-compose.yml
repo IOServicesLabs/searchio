@@ -1,0 +1,26 @@
+# Convenience compose file — the Dockerfile alone is enough; this just pins
+# the common runtime flags and the state volume.
+services:
+  mcp:
+    build: .
+    image: ghcr.io/ioserviceslabs/searchio-mcp:latest
+    # stdio mode: `docker compose run --rm mcp` speaks MCP on stdin/stdout.
+    # For SSE/HTTP instead:
+    #   command: searchio-mcp --transport sse --host 0.0.0.0 --port 8080
+    #   ports: ["8080:8080"]
+    stdin_open: true
+    tty: false
+    volumes:
+      - searchio-state:/root/.searchio
+    environment:
+      # Optional keys — the ladder degrades gracefully without them, and
+      # engine-tier fetches need none.
+      # SearXNG-style direct engines + the engine sidecar work keyless.
+      SEARCHIO_PROXY: ""            # http://user:pass@host:port when needed
+      SEARCHIO_BROWSER_PROXY: ""
+    # Chromium in a container cannot use the user-namespace sandbox; the
+    # sidecar adds --no-sandbox itself when it detects this.
+    shm_size: "1gb"
+
+volumes:
+  searchio-state:

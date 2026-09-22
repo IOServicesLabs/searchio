@@ -1,0 +1,76 @@
+name: image
+
+# Builds the all-in-one image (python tiers + Rust engine sidecar + Chromium)
+# and pushes it to ghcr. Runs on every main push (rolling :latest) and on
+# version tags (the tag becomes the image tag, minus the leading v).
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  # Docker requires lowercase repository names and github.repository_owner is
+  # mixed-case (IOServicesLabs), so pin the lowercase form rather than
+  # deriving it.
+  IMAGE: ghcr.io/ioserviceslabs/searchio-mcp
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            echo "tags=${IMAGE}:${tag},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          IMAGE: ${{ env.IMAGE }}
+
+      - name: Resolve engine clone token
+        id: engine
+        env:
+          TOKEN: ${{ secrets.ENGINE_CLONE_TOKEN }}
+        # build-push-action rejects an empty entry in `secrets:`, so the secret
+        # line is built here and left blank when the token is unset (the
+        # public-repo case -- the Dockerfile then clones anonymously).
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "secrets=engine_token=$TOKEN" >> "$GITHUB_OUTPUT"
+          else
+            echo "secrets=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          # The engine stage clones the searchio-engine repo. When the repo
+          # secret ENGINE_CLONE_TOKEN (fine-grained PAT, Contents:read on the
+          # engine repo) is set -- needed only while the engine repo is
+          # private -- it is mounted as the build secret `engine_token`.
+          # Once engine releases exist, pin ENGINE_REF to a release tag.
+          build-args: |
+            ENGINE_REF=main
+          secrets: ${{ steps.engine.outputs.secrets }}
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
