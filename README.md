@@ -4,9 +4,6 @@ searchio is a tool for search, page reading, and product lookup. Use it from
 the command line, from Python, or over HTTP. Use it as a person or as an AI
 agent. Search and reading need no API key.
 
-This manual uses Simplified Technical English (ASD-STE100). Sentences are
-short. Each step does one action.
-
 ## Quick start for AI agents
 
 An AI agent can set up searchio for its user in one pass. Follow these
