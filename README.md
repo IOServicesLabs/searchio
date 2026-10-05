@@ -245,6 +245,7 @@ The server has these tools:
 | `search` | Fused, ranked web search across keyless providers. |
 | `search_items` | Product listings with prices, merged across retailers. |
 | `search_local` | Facebook Marketplace classifieds near a city (browser-backed). |
+| `youtube_transcript` | Caption transcript of one YouTube video: timed segments + full text. |
 | `read_url` | Read one URL through the blocking-resistant ladder. Returns markdown. |
 | `research` | Run the multi-step research swarm on a question (needs an LLM key). |
 | `stats` | Ladder and provider health (per-domain learned tiers, block rates). |
@@ -282,6 +283,7 @@ searchio serve --port 8080
 | `GET /read?url=...&session=me` | Readable text of one page |
 | `GET /items?q=...&domains=...` | Product listings merged per product |
 | `GET /marketplace?q=...&city=seattle` | Facebook Marketplace listings |
+| `GET /transcript?url=...&lang=en` | YouTube caption transcript (400 not-a-video · 404 no captions · 451 refused) |
 | `POST /research` `{"question": "..."}` | The AI research swarm |
 | `GET /providers`, `GET /stats`, `GET /healthz` | Status |
 

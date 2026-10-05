@@ -8,6 +8,8 @@ smoke in the runbook -- these pin the parts that can regress silently.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import searchio.mcp as mcp_mod
@@ -20,10 +22,10 @@ def server():
 
 
 class TestToolSurface:
-    async def test_six_tools_exposed(self, server):
+    async def test_seven_tools_exposed(self, server):
         tools = {t.name: t for t in await server.list_tools()}
         assert set(tools) == {
-            "search", "search_items", "search_local",
+            "search", "search_items", "search_local", "youtube_transcript",
             "read_url", "research", "stats",
         }
 
@@ -59,6 +61,46 @@ class TestPaymentGate:
         gate = PaymentGate("static:secret-token")
         import asyncio
         asyncio.run(gate.verify("research", "Bearer secret-token"))  # no raise
+
+
+class TestYoutubeTranscriptTool:
+    """Tool execution against a stubbed engine: argument routing and the
+    error contract (a SearchioError becomes a RuntimeError naming its kind,
+    never a bare transport failure)."""
+
+    @pytest.fixture
+    async def stub_engine(self, monkeypatch):
+        calls: list[dict] = []
+
+        class Stub:
+            async def transcript(self, target, *, lang="en"):
+                calls.append({"target": target, "lang": lang})
+                if target == "boom":
+                    from searchio.errors import TranscriptError
+                    raise TranscriptError("unavailable", "no captions")
+                from searchio.models import Transcript, TranscriptSegment
+                return Transcript(
+                    video_id="dQw4w9WgXcQ",
+                    url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    lang=lang, language="English", segment_count=1, duration_sec=3.0,
+                    text="hello", segments=[TranscriptSegment(start=0.0, end=3.0, text="hello")],
+                )
+
+        monkeypatch.setattr(mcp_mod, "_ENGINE", Stub())
+        return calls
+
+    async def test_routes_url_and_lang(self, server, stub_engine):
+        result = await server.call_tool(
+            "youtube_transcript", {"url": " https://youtu.be/dQw4w9WgXcQ ", "lang": "DE"})
+        payload = json.loads(result[0].text)
+        assert payload["video_id"] == "dQw4w9WgXcQ"
+        assert payload["lang"] == "de"
+        assert stub_engine == [{"target": "https://youtu.be/dQw4w9WgXcQ", "lang": "de"}]
+
+    async def test_transcript_error_names_its_kind(self, server, stub_engine):
+        with pytest.raises(Exception) as exc:
+            await server.call_tool("youtube_transcript", {"url": "boom"})
+        assert "unavailable" in str(exc.value)
 
     def test_env_var_enables_gate(self, monkeypatch):
         monkeypatch.setenv("SEARCHIO_MCP_PAYMENT", "static:env-token")

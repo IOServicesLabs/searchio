@@ -121,6 +121,23 @@ class LoginHandoffError(SearchioError):
     """
 
 
+class TranscriptError(SearchioError):
+    """A YouTube transcript could not be pulled.
+
+    ``kind`` is what an agent can branch on and what the HTTP layer maps to
+    a status: ``invalid_target`` (the caller's string was not a video --
+    400), ``unavailable`` (the video or its captions do not exist -- 404),
+    ``blocked`` (YouTube refused the caption request -- 451, same as every
+    other anti-bot wall). Anything unexpected is ``upstream`` (502). Unlike
+    the ladder errors above there is no escalation: a caption fetch has one
+    tier, the PO-token handshake youtube-transcript-api maintains.
+    """
+
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(f"{kind}: {message}")
+
+
 class LoginHandoffUnavailable(LoginHandoffError):
     """The headed backend (patchright) cannot be started here."""
 

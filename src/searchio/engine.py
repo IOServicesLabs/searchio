@@ -289,6 +289,22 @@ class Engine:
         doc.fetched_via = res.via
         return doc
 
+    async def transcript(self, target: str, *, lang: str = "en") -> Transcript:
+        """Caption transcript of one YouTube video.
+
+        ``target`` is a watch / youtu.be / shorts / embed / live URL or a bare
+        11-char video id; ``lang`` is the preferred caption language. This
+        rides youtube-transcript-api, not the ladder: captions are a
+        PO-token-gated handshake the library maintains (see
+        :mod:`searchio.transcripts`), and no fetch tier can substitute for
+        it. A missing track is a typed TranscriptError, never an honest
+        empty.
+        """
+        from .transcripts import fetch_transcript
+
+        wanted = lang.strip() or "en"
+        return await fetch_transcript(target, languages=[wanted])
+
     # ── the swarm ────────────────────────────────────────────────────────────
 
     async def research(self, question: str, *, progress=None) -> ResearchResult:

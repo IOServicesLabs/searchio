@@ -13,8 +13,8 @@ import httpx
 import pytest
 
 import searchio.server as server
-from searchio.errors import Blocked, ProviderError, TargetRefused, TransientError
-from searchio.models import Doc, FetchResult, Item, Price
+from searchio.errors import Blocked, ProviderError, TargetRefused, TransientError, TranscriptError
+from searchio.models import Doc, FetchResult, Item, Price, Transcript, TranscriptSegment
 
 
 class FakeEng:
@@ -25,6 +25,8 @@ class FakeEng:
         self.failed: dict = {}
         self.items_exc: Exception | None = None
         self.fetch_exc: Exception | None = None
+        self.transcript_exc: Exception | None = None
+        self.transcript_kw: list[dict] = []
         self.ladder = SimpleNamespace(fetch=self._fetch,
                                       profiles=SimpleNamespace(all=lambda: []))
         self.router = SimpleNamespace(health_report=lambda: {})
@@ -43,6 +45,15 @@ class FakeEng:
         if self.items_exc:
             raise self.items_exc
         return []
+
+    async def transcript(self, target, *, lang="en"):
+        self.transcript_kw.append({"target": target, "lang": lang})
+        if self.transcript_exc:
+            raise self.transcript_exc
+        return Transcript(
+            video_id="dQw4w9WgXcQ", url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            lang=lang, language="English", segment_count=1, duration_sec=3.0, text="hello",
+            segments=[TranscriptSegment(start=0.0, end=3.0, text="hello")])
 
     async def _fetch(self, url, **kw):
         if self.fetch_exc:
@@ -107,6 +118,37 @@ class TestErrorStatusesAreStable:
         eng.used = ["bing"]
         r = await c.get("/search", params={"q": "x"})
         assert r.status_code == 200 and r.json()["results"] == []
+
+
+class TestTranscript:
+    """Bug class after the fact: /transcript must fold its inputs like the
+    other routes and must map every TranscriptError kind to its own status,
+    so an agent can tell "not a video" (400), "no captions" (404) and
+    "YouTube refused us" (451) apart without parsing message text."""
+
+    async def test_happy_path_folds_and_passes_lang(self, api):
+        c, eng = api
+        r = await c.get("/transcript", params={"url": "  https://youtu.be/dQw4w9WgXcQ  ", "lang": " DE "})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["video_id"] == "dQw4w9WgXcQ"
+        assert d["segments"][0]["text"] == "hello"
+        assert eng.transcript_kw == [{"target": "https://youtu.be/dQw4w9WgXcQ", "lang": "de"}]
+
+    async def test_error_kinds_map_to_statuses(self, api):
+        c, eng = api
+        for kind, status in [("invalid_target", 400), ("unavailable", 404),
+                             ("blocked", 451), ("upstream", 502)]:
+            eng.transcript_exc = TranscriptError(kind, f"synthetic {kind}")
+            r = await c.get("/transcript", params={"url": "x"})
+            assert r.status_code == status, (kind, r.text)
+            assert kind in r.json()["detail"]
+        eng.transcript_exc = None
+
+    async def test_blank_url_is_a_422(self, api):
+        c, eng = api
+        r = await c.get("/transcript", params={"url": "   "})
+        assert r.status_code == 422, r.text
 
 
 class TestRequestContract:

@@ -137,6 +137,38 @@ class FetchResult(BaseModel):
     rendered: bool = False
 
 
+class TranscriptSegment(BaseModel):
+    """One timed piece of a YouTube transcript.
+
+    Shape matches the SwarmIO media sidecar's ``captions`` segments so a
+    caller can treat both payloads identically.
+    """
+
+    start: float  # seconds into the video
+    end: float
+    text: str
+
+
+class Transcript(BaseModel):
+    """The caption track of one YouTube video.
+
+    ``source`` is ``captions`` because this is a track YouTube already
+    publishes, not a transcription: it is the transcript of record when it
+    exists, and when it does not the fetch raises instead of returning an
+    empty model.
+    """
+
+    video_id: str
+    url: str = ""  # canonical watch URL
+    lang: str = "en"  # requested language that won
+    language: str = ""  # human-readable track name
+    source: str = "captions"
+    segment_count: int = 0
+    duration_sec: float = 0.0  # end of the last segment
+    text: str = ""  # all segments joined
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+
+
 # ── Swarm ────────────────────────────────────────────────────────────────────
 
 

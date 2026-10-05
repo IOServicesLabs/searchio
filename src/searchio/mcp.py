@@ -238,6 +238,27 @@ def build_server() -> "FastMCP":
                 "items": [_to_jsonable(i) for i in items]}
 
     @mcp.tool()
+    async def youtube_transcript(url: str, lang: str = "en") -> dict:
+        """Pull the caption transcript of one YouTube video.
+
+        Uses the caption track YouTube already publishes -- no audio
+        download, no transcription -- so it is fast and the transcript of
+        record when it exists. Returns timed segments plus the full plain
+        text. A video without captions, or a string that is not a video, is
+        an error naming which; it is never an empty success.
+
+        Args:
+            url: watch/youtu.be/shorts URL or bare 11-char video id.
+            lang: Preferred caption language, e.g. "en", "de".
+        """
+        eng = await _engine()
+        t = await _guarded(
+            "youtube_transcript",
+            eng.transcript(url.strip(), lang=lang.strip().lower() or "en"),
+        )
+        return _to_jsonable(t)
+
+    @mcp.tool()
     async def read_url(url: str) -> dict:
         """Fetch one URL through the blocking-resistant acquisition ladder.
 

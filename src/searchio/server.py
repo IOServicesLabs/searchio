@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .config import get_settings
 from .engine import Engine
-from .errors import Blocked, ConfigError, SearchioError, TargetRefused
+from .errors import Blocked, ConfigError, SearchioError, TargetRefused, TranscriptError
 
 _engine: Engine | None = None
 
@@ -59,6 +59,12 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(400, f"target_refused: {exc}")
     if isinstance(exc, ConfigError):
         return HTTPException(400, str(exc))
+    if isinstance(exc, TranscriptError):
+        # A transcript failure has no tier to escalate to, so the kind IS
+        # the status: the caller's string was not a video (400), the video
+        # or its captions do not exist (404), YouTube refused us (451).
+        status = {"invalid_target": 400, "unavailable": 404, "blocked": 451}.get(exc.kind, 502)
+        return HTTPException(status, f"{exc.kind}: {exc}")
     if isinstance(exc, SearchioError):
         return HTTPException(502, f"{type(exc).__name__}: {exc}")
     if isinstance(exc, ValidationError):
@@ -246,6 +252,25 @@ async def read(url: str = QueryParam(..., max_length=4096,
         "title": title_of(res.body),
         "text": to_markdown(res.body, url),
     }
+
+
+@app.get("/transcript")
+async def transcript(
+    url: str = QueryParam(..., min_length=1, max_length=2000,
+                          description="YouTube watch/youtu.be/shorts URL or bare video id."),
+    lang: str = QueryParam("en", max_length=35, description="Preferred caption language, e.g. en, de."),
+) -> dict:
+    # Same contract as /search and /read: fold the blank, then let the
+    # typed TranscriptError pick the status (400/404/451/502).
+    target = url.strip()
+    if not target:
+        raise HTTPException(422, "url is blank")
+    eng = engine()
+    try:
+        t = await eng.transcript(target, lang=lang.strip().lower() or "en")
+    except (SearchioError, ValidationError) as exc:
+        raise _http_error(exc) from exc
+    return t.model_dump()
 
 
 @app.post("/research")

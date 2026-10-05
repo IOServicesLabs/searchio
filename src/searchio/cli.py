@@ -330,6 +330,34 @@ def read(
 
 
 @app.command()
+def transcript(
+    url: str = typer.Argument(..., help="YouTube watch/youtu.be/shorts URL or bare video id."),
+    lang: str = typer.Option("en", "--lang", help="Preferred caption language."),
+    chars: int = typer.Option(4000, "--chars", help="Characters of text to print."),
+) -> None:
+    """Pull one YouTube video's caption transcript."""
+    s = _settings(None, False)
+
+    async def go():
+        async with Engine(s) as eng:
+            try:
+                t = await eng.transcript(url, lang=lang)
+            except SearchioError as exc:
+                err_console.print(f"[bold red]{type(exc).__name__}:[/] {exc}")
+                raise typer.Exit(1)
+        console.print(Panel(
+            f"[bold]{t.url}[/]\n"
+            f"[dim]{t.language or t.lang} · {t.segment_count} segments · "
+            f"{t.duration_sec:.0f}s · {len(t.text):,} chars[/]",
+            expand=False))
+        console.print(t.text[:chars])
+        if len(t.text) > chars:
+            console.print(f"[dim]... {len(t.text) - chars:,} more characters[/]")
+
+    _run(go())
+
+
+@app.command()
 def research(
     question: str = typer.Argument(..., help="The research question."),
     json_out: bool = typer.Option(False, "--json"),
