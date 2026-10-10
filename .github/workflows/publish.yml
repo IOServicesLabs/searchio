@@ -65,3 +65,27 @@ jobs:
           # A retag re-runs this job after a successful upload; duplicates
           # then warn instead of failing the run.
           skip-existing: true
+
+  # Lists the release on the official MCP Registry (registry.modelcontextprotocol.io),
+  # which feeds VS Code, GitHub's MCP directory, PulseMCP and other catalogs.
+  # Auth is GitHub OIDC, so no secret: a workflow in the IOServicesLabs org may
+  # publish io.github.IOServicesLabs/*. The registry checks ownership through
+  # `mcpName` in packaging/npm/package.json and rejects versions npm does not
+  # have yet, hence the needs.
+  mcp-registry:
+    needs: [npm, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stamp the tag version into server.json
+        run: |
+          jq --arg v "${GITHUB_REF_NAME#v}"             '.version = $v | .packages |= map(.version = $v)' server.json > server.tmp
+          mv server.tmp server.json
+      - name: Publish
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

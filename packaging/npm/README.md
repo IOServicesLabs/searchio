@@ -49,3 +49,5 @@ npx @ioserviceslabs/searchio-mcp --transport sse --host 0.0.0.0 --port 8080
 | `SEARCHIO_MCP_CMD` | — | Operator override; replaces the whole backend choice |
 | `SEARCHIO_MCP_IMAGE` | `ghcr.io/ioserviceslabs/searchio-mcp:latest` | Docker image the launcher runs |
 | `SEARCHIO_DOCKER` | `auto` | Set `0` to skip the Docker backend |
+
+<!-- mcp-name: io.github.IOServicesLabs/searchio -->

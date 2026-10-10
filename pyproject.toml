@@ -2,6 +2,8 @@
 name = "searchio"
 version = "0.1.0"
 description = "LLM-assisted search: a research swarm over a blocking-resistant acquisition ladder."
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.69",
@@ -24,6 +26,10 @@ dependencies = [
     # gate (see src/searchio/transcripts.py). Pure Python, no browser.
     "youtube-transcript-api>=1.2",
 ]
+
+[project.urls]
+Homepage = "https://www.ioservices.io/searchio"
+Repository = "https://github.com/IOServicesLabs/searchio"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]

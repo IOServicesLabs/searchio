@@ -357,3 +357,5 @@ in a `.env` file next to where you run it. The ones people change most:
   browser-backed lookups run anonymously.
 - `searchio providers` lists every source and whether it is configured.
 - `searchio doctor` is the first thing to run when something looks off.
+
+<!-- mcp-name: io.github.IOServicesLabs/searchio -->

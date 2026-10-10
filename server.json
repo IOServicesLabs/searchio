@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.IOServicesLabs/searchio",
+  "title": "searchio",
+  "description": "Keyless web search and page reading for AI agents, built to get past bot walls.",
+  "websiteUrl": "https://www.ioservices.io/searchio",
+  "repository": {
+    "url": "https://github.com/IOServicesLabs/searchio",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@ioserviceslabs/searchio-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
