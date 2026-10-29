@@ -12,6 +12,10 @@ dependencies = [
     "zstandard>=0.22",
     "curl_cffi>=0.7",
     "trafilatura>=1.12",
+    # trafilatura's justext imports lxml.html.clean, which lxml >= 5.2 moved
+    # to its own package: without it trafilatura fails to import and every
+    # HTML read falls back to a crude tag strip (found 2026-10-28).
+    "lxml_html_clean>=0.1",
     "pypdf>=4",
     "selectolax>=0.3.21,<1.0",
     "pydantic>=2.7",
@@ -39,7 +43,9 @@ dev = ["pytest>=8", "pytest-asyncio>=0.23", "respx>=0.21"]
 mcp = ["mcp>=1.8,<2"]
 
 [project.scripts]
-searchio = "searchio.cli:app"
+# fastcli hands `search --json` to a running `searchio serve` when
+# SEARCHIO_DAEMON_URL is set; everything else is the typer app.
+searchio = "searchio.fastcli:main"
 # LLM-facing entry: `searchio-mcp` boots the MCP server over stdio the moment
 # the package is installed (requires the `mcp` extra). Engine tier activates
 # when a se-serve binary is resolvable (SEARCHIO_ENGINE_BIN, a sibling

@@ -96,3 +96,53 @@ class TestTheWarmupPrimesTheCallsOwnTab:
         closed = sorted(e[2] for e in sc.events if e[0] == "close_tab")
         opened = sorted(set(e[2] for e in sc.events if e[0] in ("fetch", "goto")))
         assert closed == opened, sc.events
+
+
+class WallPageSidecar(WarmupSidecar):
+    """Serves an unflagged 200 "Access Denied" wall until the tab is primed."""
+
+    async def fetch(self, url, **kw):
+        tab = kw.get("tab_id")
+        self.events.append(("fetch", url, tab))
+        if tab in self.primed:
+            html = "<html><body><p>" + ("real content " * 60) + "</p></body></html>"
+            return {"ok": True, "status": 200, "html": html, "url": url}
+        wall = ("<html><head><title>Access Denied</title></head><body><h1>Access Denied</h1>"
+                "You don't have permission to access this server. Reference #18.1</body></html>")
+        return {"ok": True, "status": 200, "html": wall, "url": url}
+
+
+class TestWarmupOnAnUnflaggedWall:
+    """tier2_warmup_on_wall: a 200 wall page the sidecar did not flag still
+    earns the origin warm-up and one retry."""
+
+    @pytest.mark.parametrize("on", [False, True])
+    async def test_wall_page_triggers_the_warmup_only_when_on(self, tmp_path, on):
+        s = Settings(state_dir=tmp_path, cache_enabled=False, robots_policy="off", max_tier=2,
+                     per_domain_rps=1000.0, per_domain_burst=1000, sidecar_autostart=False,
+                     tier2_warmup_on_wall=on)
+        sc = WallPageSidecar()
+        lad = Ladder(s, sidecar=sc)
+        try:
+            res = await lad._tier2("https://walled.example/deep/page")
+        finally:
+            await lad.close()
+        gotos = [e for e in sc.events if e[0] == "goto"]
+        assert bool(gotos) is on, sc.events
+        assert ("real content" in res[2]) is on, res[2][:80]
+
+    async def test_a_real_page_costs_no_warmup(self, settings):
+        class Ok(WallPageSidecar):
+            async def fetch(self, url, **kw):
+                self.events.append(("fetch", url, kw.get("tab_id")))
+                return {"ok": True, "status": 200, "url": url,
+                        "html": "<html><body><p>" + ("fine page " * 60) + "</p></body></html>"}
+
+        ok = Ok()
+        settings.tier2_warmup_on_wall = True
+        lad = Ladder(settings, sidecar=ok)
+        try:
+            await lad._tier2("https://fine.example/page")
+        finally:
+            await lad.close()
+        assert not [e for e in ok.events if e[0] == "goto"], ok.events

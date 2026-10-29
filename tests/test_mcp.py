@@ -22,10 +22,10 @@ def server():
 
 
 class TestToolSurface:
-    async def test_seven_tools_exposed(self, server):
+    async def test_nine_tools_exposed(self, server):
         tools = {t.name: t for t in await server.list_tools()}
         assert set(tools) == {
-            "search", "search_items", "search_local", "youtube_transcript",
+            "search", "search_many", "read_many", "search_items", "search_local", "youtube_transcript",
             "read_url", "research", "stats",
         }
 

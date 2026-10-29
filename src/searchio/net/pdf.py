@@ -50,7 +50,7 @@ def looks_like_pdf(data: bytes) -> bool:
 
 
 def extract_text(
-    data: bytes, max_pages: int = DEFAULT_MAX_PAGES
+    data: bytes, max_pages: int = DEFAULT_MAX_PAGES, char_budget: int = 0
 ) -> tuple[str, int, int]:
     """Extract visible text from PDF bytes.
 
@@ -72,9 +72,13 @@ def extract_text(
         used = 0
         # A cap below 1 is a cap of 1, not a negative slice that silently
         # drops the LAST pages (iteration 49 rider).
+        got = 0
         for page in reader.pages[: max(1, int(max_pages))]:
             parts.append(page.extract_text() or "")
             used += 1
+            got += len(parts[-1])
+            if char_budget > 0 and got >= char_budget:
+                break  # pdf_read_budget: the reader keeps no more than this
     except PdfUnreadable:
         raise
     except Exception as exc:  # pypdf raises a zoo of parse errors

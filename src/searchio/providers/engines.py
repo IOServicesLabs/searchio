@@ -17,9 +17,12 @@ all failed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import random
 import re
 import urllib.parse
+from collections import deque
 from html import unescape
 
 from ..errors import Blocked, ProviderError, SearchioError
@@ -312,6 +315,15 @@ def specific_terms(terms: list[str]) -> list[str]:
     web.js_docs). Queries without a model code fall through to the coverage
     rule, which is where brush-offs like the PostgreSQL homepage are caught.
     """
+    from ..config import get_settings
+
+    if getattr(get_settings(), "degraded_codes_strict", False):
+        # "6-speed", "3-way", "2-in-1" carry a digit but are vocabulary:
+        # results say "manual" and the rule condemned a good SERP. A part
+        # must mix letters and digits (1000xm5) or be 3+ digits (2023).
+        return [t for t in terms if any(
+            (any(c.isdigit() for c in p) and any(c.isalpha() for c in p))
+            or (p.isdigit() and len(p) >= 3) for p in t.split("-"))]
     return [t for t in terms if any(c.isdigit() for c in t)]
 
 
@@ -385,6 +397,72 @@ def _bing_freshness(freshness: str) -> str:
     return ""
 
 
+async def run_hedged(attempts, hedge_ms: int, stop=None) -> tuple[list[Doc] | None, list[str]]:
+    """Run endpoint attempts in fallback order, optionally hedged.
+
+    Each attempt is a zero-arg coroutine factory returning ``(docs, err)``:
+    docs on success, ``(None, reason)`` on failure. With ``hedge_ms <= 0``
+    this is the plain sequential fallback. Otherwise attempt i+1 starts as
+    soon as attempt i fails OR has been running ``hedge_ms`` without an
+    answer, and the first success in hand wins; the losers are cancelled. A
+    slow primary then costs the fallback's latency, not the sum of both.
+    Errors come back in attempt order, so the provider's refusal text reads
+    the same either way.
+
+    ``stop(err)`` returning True on a failed attempt ends the fallback: no
+    later attempt starts and running ones are cancelled. A provider uses it
+    when one endpoint's failure already answers for its siblings.
+    """
+    if hedge_ms <= 0 or len(attempts) < 2:
+        errors: list[str] = []
+        for make in attempts:
+            docs, err = await make()
+            if docs is not None:
+                return docs, errors
+            errors.append(err)
+            if stop is not None and stop(err):
+                break
+        return None, errors
+
+    hedge_s = hedge_ms / 1000.0
+    tasks: list[asyncio.Task] = []
+    errs: dict[int, str] = {}
+
+    def launch() -> None:
+        tasks.append(asyncio.ensure_future(attempts[len(tasks)]()))
+
+    launch()
+    try:
+        while True:
+            running = [t for t in tasks if not t.done()]
+            more = len(tasks) < len(attempts)
+            if not running:
+                if not more:
+                    break
+                launch()  # everything so far failed: fall back now
+                continue
+            done, _ = await asyncio.wait(
+                running, timeout=hedge_s if more else None,
+                return_when=asyncio.FIRST_COMPLETED)
+            # Harvest every finished attempt, in attempt order: a success
+            # from the primary beats a same-tick success from the hedge.
+            for i, t in enumerate(tasks):
+                if t.done() and i not in errs:
+                    docs, err = t.result()
+                    if docs is not None:
+                        return docs, [errs[j] for j in sorted(errs)]
+                    errs[i] = err
+                    if stop is not None and stop(err):
+                        return None, [errs[j] for j in sorted(errs)]
+            if not done and more:
+                launch()  # the primary is slow: hedge
+        return None, [errs[j] for j in sorted(errs)]
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+
 class DuckDuckGo(Provider):
     """DuckDuckGo via its no-JavaScript HTML endpoints."""
 
@@ -397,34 +475,101 @@ class DuckDuckGo(Provider):
         ("https://lite.duckduckgo.com/lite/?q={q}", parse_ddg_lite),
     )
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._order = _EndpointOrder()
+
     async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
         query = urllib.parse.quote_plus(_apply_operators(q))
         fresh = _DDG_FRESH.get(q.freshness, "")
-        errors: list[str] = []
-        for tmpl, parser in self.ENDPOINTS:
-            url = tmpl.format(q=query)
-            if fresh:
-                url += f"&df={fresh}"
-            try:
-                res = await ctx.ladder.fetch(url, max_tier=1)
-            except Blocked as exc:
-                errors.append(f"{url.split('/')[2]}: blocked({exc.vendor})")
-                continue
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}")
-                continue
-            rows = parser(res.body, q.k)
-            if rows and looks_degraded(q.text, rows):
-                errors.append("degraded_results")
-                continue
-            if rows:
-                return [
-                    Doc(url=u, title=t, snippet=s, source=self.name, rank=i,
-                        published=pub or None)
-                    for i, (u, t, s, pub) in enumerate(rows)
-                ]
-            errors.append("no_results")
-        raise ProviderError(self.name, "; ".join(errors) or "no results")
+
+        def attempt(tmpl, parser):
+            async def run() -> tuple[list[Doc] | None, str]:
+                url = tmpl.format(q=query)
+                if fresh:
+                    url += f"&df={fresh}"
+                try:
+                    res = await ctx.ladder.fetch(url, max_tier=1)
+                except Blocked as exc:
+                    return None, f"{url.split('/')[2]}: blocked({exc.vendor})"
+                except Exception as exc:
+                    return None, f"{type(exc).__name__}"
+                rows = await _parse(ctx, parser, res.body, q.k)
+                if rows and looks_degraded(q.text, rows):
+                    return None, "degraded_results"
+                if rows:
+                    return [
+                        Doc(url=u, title=t, snippet=s, source=self.name, rank=i,
+                            published=pub or None)
+                        for i, (u, t, s, pub) in enumerate(rows)
+                    ], ""
+                return None, "no_results"
+            return run
+
+        s = getattr(ctx, "settings", None)
+        # html and lite are one backend behind one IP reputation: a wall on
+        # the first is the answer for both (measured live: lite drew the
+        # same anomaly modal every time, ~3 s later, after the limiter's
+        # post-block wait).
+        stop = _is_wall if getattr(s, "block_skip_siblings", False) else None
+        makers = [attempt(t, p) for t, p in self.ENDPOINTS]
+        idx = self._order.order(len(makers), getattr(s, "endpoint_learning", False))
+        docs, errors = await run_hedged(
+            self._order.wrap(idx, makers), getattr(s, "hedge_ms", 0), stop)
+        if docs is not None:
+            return docs
+        raise ProviderError(self.name, "; ".join(errors) or "no results",
+                            walled=bool(errors) and all(_is_wall(e) for e in errors))
+
+
+#: parse_offloop: bodies at least this large parse on a worker thread.
+_OFFLOOP_MIN = 20_000
+
+
+async def _parse(ctx, parser, body: str, k: int):
+    """``parser(body, k)``, on a worker thread for a large body when
+    ``parse_offloop`` is on: a ~124 KB Bing HTML SERP parsed on the loop
+    holds every other provider's response handling behind it."""
+    if getattr(getattr(ctx, "settings", None), "parse_offloop", False) and len(body) >= _OFFLOOP_MIN:
+        return await asyncio.get_running_loop().run_in_executor(None, parser, body, k)
+    return parser(body, k)
+
+
+class _EndpointOrder:
+    """endpoint_learning: lead with the endpoint that answered last time.
+
+    When a provider's primary failed and a fallback answered, the next
+    search starts on that fallback instead of re-paying the primary's
+    failure first. Self-correcting: if the lead fails, the remaining order
+    runs as usual and whichever answers becomes the lead (the primary
+    winning resets it).
+    """
+
+    def __init__(self) -> None:
+        self.lead: int | None = None
+
+    def order(self, n: int, on: bool) -> list[int]:
+        idx = list(range(n))
+        if on and self.lead is not None and 0 < self.lead < n:
+            idx.remove(self.lead)
+            idx.insert(0, self.lead)
+        return idx
+
+    def wrap(self, idx: list[int], makers: list) -> list:
+        """Attempts in ``idx`` order, each noting itself as the winner."""
+        def tag(i, make):
+            async def run():
+                docs, err = await make()
+                if docs is not None:
+                    self.lead = i if i != 0 else None
+                return docs, err
+            return run
+        return [tag(i, makers[i]) for i in idx]
+
+
+def _is_wall(err: str) -> bool:
+    """An attempt's error text says an anti-bot wall refused it."""
+    return "blocked(" in err
 
 
 _RSS_ITEM = re.compile(r"<item>(.*?)</item>", re.I | re.S)
@@ -493,6 +638,14 @@ class Bing(Provider):
     name = "bing"
     caps = frozenset({Capability.WEB, Capability.NEWS, Capability.SHOPPING})
     primary_domain = "bing.com"
+    #: degraded_skip re-asks the HTML SERP one time in this many.
+    PROBE_ODDS = 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: Did the HTML fallback answer, the last few times RSS was degraded?
+        self._html_after_degraded: deque[bool] = deque(maxlen=3)
+        self._order = _EndpointOrder()
 
     async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
         text = urllib.parse.quote_plus(_apply_operators(q))
@@ -504,44 +657,77 @@ class Bing(Provider):
         fresh = _bing_freshness(q.freshness)
         if fresh:
             loc += "&filters=" + urllib.parse.quote(fresh)
-        attempts = (
-            (f"https://www.bing.com/search?q={text}&format=rss"
-             f"&count={max(q.k, 10)}{loc}", parse_bing_rss),
-            (f"https://www.bing.com/search?q={text}{loc}", parse_bing),
-        )
-        errors: list[str] = []
-        for url, parser in attempts:
-            try:
-                res = await ctx.ladder.fetch(url, max_tier=1)
-            except Blocked as exc:
-                errors.append(f"blocked({exc.vendor})")
-                continue
-            except SearchioError as exc:
-                # Any fetch failure -- a transient reset/timeout, a refusal --
-                # is this ATTEMPT failing, not Bing failing (bug 172): the
-                # RSS->HTML ladder exists so a flaky RSS fetch falls back to
-                # the HTML SERP. Only Blocked was caught before, so a common
-                # transient RSS error skipped the fallback and failed the
-                # provider outright. The parse call stays OUTSIDE the try, so
-                # a parser regression still surfaces.
-                errors.append(f"{type(exc).__name__}: {str(exc)[:60]}")
-                continue
-            rows = parser(res.body, q.k)
-            if not rows:
-                errors.append("no_results")
-                continue
-            if looks_degraded(q.text, rows):
-                # Not an error we can retry around -- the engine is brushing this
-                # client off. Report it so the router opens the breaker and the
-                # fan-out leans on providers that are still answering honestly.
-                errors.append("degraded_results")
-                continue
-            return [
-                Doc(url=u, title=t, snippet=s, source=self.name, rank=i,
-                    published=pub or None)
-                for i, (u, t, s, pub) in enumerate(rows)
-            ]
-        raise ProviderError(self.name, "; ".join(errors) or "no results")
+        s = getattr(ctx, "settings", None)
+        # bing_html_tier1: on hard queries Bing brushes off its RSS endpoint
+        # (any client) and its HTML SERP fetched with httpx's fingerprint, but
+        # answers the HTML SERP honestly for a Chrome-impersonating client
+        # (2026-10-28 probe: "Chilton repair manual" vs real used-car hits).
+        html_tier = 1 if getattr(s, "bing_html_tier1", False) else None
+        html_first = getattr(s, "bing_html_first", False)
+        rss = (f"https://www.bing.com/search?q={text}&format=rss"
+               f"&count={max(q.k, 10)}{loc}", parse_bing_rss, None)
+        html = (f"https://www.bing.com/search?q={text}{loc}", parse_bing, html_tier)
+        attempts = (html, rss) if html_first else (rss, html)
+
+        def attempt(url, parser, tier=None):
+            async def run() -> tuple[list[Doc] | None, str]:
+                try:
+                    res = await ctx.ladder.fetch(url, max_tier=1, force_tier=tier)
+                except Blocked as exc:
+                    return None, f"blocked({exc.vendor})"
+                except SearchioError as exc:
+                    # Any fetch failure -- a transient reset/timeout, a
+                    # refusal -- is this ATTEMPT failing, not Bing failing
+                    # (bug 172): the RSS->HTML ladder exists so a flaky RSS
+                    # fetch falls back to the HTML SERP. Only Blocked was
+                    # caught before, so a common transient RSS error skipped
+                    # the fallback and failed the provider outright. The
+                    # parse call stays OUTSIDE the try, so a parser
+                    # regression still surfaces.
+                    return None, f"{type(exc).__name__}: {str(exc)[:60]}"
+                rows = await _parse(ctx, parser, res.body, q.k)
+                if not rows:
+                    return None, "no_results"
+                if looks_degraded(q.text, rows):
+                    # Not an error we can retry around -- the engine is
+                    # brushing this client off. Report it so the router opens
+                    # the breaker and the fan-out leans on providers that are
+                    # still answering honestly.
+                    return None, "degraded_results"
+                return [
+                    Doc(url=u, title=t, snippet=s, source=self.name, rank=i,
+                        published=pub or None)
+                    for i, (u, t, s, pub) in enumerate(rows)
+                ], ""
+            return run
+
+        # The HTML-after-degraded bookkeeping assumes RSS goes first.
+        learn = getattr(s, "degraded_skip", False) and not html_first
+
+        def stop(err: str) -> bool:
+            if getattr(s, "block_skip_siblings", False) and _is_wall(err):
+                return True
+            # A degraded RSS is the engine brushing this egress off; when the
+            # HTML SERP has said the same the last few times, asking it again
+            # costs a round trip for an answer we already know. One in
+            # PROBE_ODDS still asks, so a recovered HTML path is noticed.
+            return (learn and err == "degraded_results"
+                    and len(self._html_after_degraded) == self._html_after_degraded.maxlen
+                    and not any(self._html_after_degraded)
+                    and random.randrange(self.PROBE_ODDS) != 0)
+
+        makers = [attempt(u, p, t) for u, p, t in attempts]
+        idx = self._order.order(len(makers), getattr(s, "endpoint_learning", False))
+        docs, errors = await run_hedged(
+            self._order.wrap(idx, makers), getattr(s, "hedge_ms", 0), stop)
+        if (not html_first and idx[0] == 0 and errors[:1] == ["degraded_results"]
+                and (docs is not None or len(errors) > 1)):
+            # The HTML fallback ran after a degraded RSS: remember how it did.
+            self._html_after_degraded.append(docs is not None)
+        if docs is not None:
+            return docs
+        raise ProviderError(self.name, "; ".join(errors) or "no results",
+                            walled=bool(errors) and all(_is_wall(e) for e in errors))
 
 
 class SidecarSearch(Provider):

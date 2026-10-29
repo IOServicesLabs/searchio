@@ -14,6 +14,7 @@ from .apis import (
     Crossref,
     GitHubRepos,
     HackerNews,
+    Marginalia,
     OpenAlex,
     StackExchange,
     Wikipedia,
@@ -36,6 +37,8 @@ def default_providers() -> list[Provider]:
         # Keyless general web
         DuckDuckGo(),
         Bing(),
+        # Keyless general web, opt-in (marginalia_enabled; CC-BY-NC-SA)
+        Marginalia(),
         # Keyless structured
         Wikipedia(),
         HackerNews(),

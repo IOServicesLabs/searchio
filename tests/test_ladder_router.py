@@ -76,6 +76,8 @@ class TestEscalation:
         await lad.close()
 
     async def test_climbs_past_an_empty_shell(self, settings):
+        # Climb mechanics: thin_skip_tier1 (a JS shell skips tier 1) is off.
+        settings = settings.model_copy(update={"thin_skip_tier1": False})
         lad = FakeLadder(settings, {
             0: (200, {"content-type": HTML}, '<html><div id="root"></div></html>'),
             1: (200, {"content-type": HTML}, GOOD),

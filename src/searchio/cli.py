@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import json as jsonlib
 import sys
+import time
 
 import typer
 from pydantic import ValidationError
 from rich.console import Console
 from rich.json import JSON
+from rich.markup import escape as _esc
 from rich.panel import Panel
 from rich.table import Table
 
@@ -107,7 +109,9 @@ def _report_no_items(eng, intent: str) -> None:
 
 def _run(coro):
     try:
-        return asyncio.run(coro)
+        from ._loop import run
+
+        return run(coro)
     except ValidationError as exc:
         # An invalid argument (--intent bogus) used to escape as a rich
         # traceback -- exit 1 with forty frames for an expected input
@@ -308,6 +312,26 @@ def read(
 
     async def go():
         async with Engine(s) as eng:
+            if getattr(s, "read_via_engine", False):
+                # read_via_engine: the same Engine.read the MCP tool uses --
+                # lean reads, markdown negotiation, the redirect memo, the
+                # PDF budget -- instead of a bare ladder fetch + extraction.
+                t0 = time.monotonic()
+                try:
+                    doc = await eng.read(url)
+                except Blocked as exc:
+                    err_console.print(f"[bold red]blocked[/] by {exc.vendor or 'unknown'}: {exc.reason}")
+                    raise typer.Exit(1)
+                text = doc.text
+                console.print(Panel(
+                    f"[bold]{_esc(doc.title or url)}[/]\n"
+                    f"[dim]{_esc(doc.url)}\nvia {doc.fetched_via} · "
+                    f"{int((time.monotonic() - t0) * 1000)}ms · {len(text):,} chars[/]",
+                    expand=False))
+                console.print(text[:chars], markup=False, highlight=False)
+                if len(text) > chars:
+                    console.print(f"[dim]... {len(text) - chars:,} more characters[/]")
+                return
             try:
                 res = await eng.ladder.fetch(url)
             except Blocked as exc:
@@ -317,12 +341,12 @@ def read(
 
             text = to_markdown(res.body, url)
             console.print(Panel(
-                f"[bold]{title_of(res.body) or url}[/]\n"
-                f"[dim]{res.final_url}\ntier {res.tier} ({res.via}) · {res.status} · "
+                f"[bold]{_esc(title_of(res.body) or url)}[/]\n"
+                f"[dim]{_esc(res.final_url)}\ntier {res.tier} ({res.via}) · {res.status} · "
                 f"{res.elapsed_ms}ms · {len(text):,} chars"
                 + (f"\nescalations: {res.escalations}" if res.escalations else "") + "[/]",
                 expand=False))
-            console.print(text[:chars])
+            console.print(text[:chars], markup=False, highlight=False)
             if len(text) > chars:
                 console.print(f"[dim]... {len(text) - chars:,} more characters[/]")
 

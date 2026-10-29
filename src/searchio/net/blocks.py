@@ -96,6 +96,9 @@ _BLOCK_MARKUP: tuple[str, ...] = (
     # an honest refusal where a block (and its rescue) was owed.
     "captcha-delivery.com",  # DataDome
     "cf-browser-verification",  # Cloudflare (legacy)
+    # Anubis (proof-of-work wall; Arch wiki, many forges): a 200 whose only
+    # words are "Making sure you're not a bot!" -- read as the page before.
+    'id="anubis_challenge"',
 )
 
 #: <title> signatures of a wall. The title is the vendor's own label, so it
@@ -123,6 +126,15 @@ _SOFT_ERROR_MARKERS: tuple[str, ...] = (
     "service unavailable",
     "bad gateway",
 )
+
+#: A CDN edge's own refusal ID. Akamai's edge error pages -- "Access Denied"
+#: and the 200 "site is currently unavailable" alike -- carry a dotted
+#: reference (``Reference #18.2a34d517.1793229018.7253767``, ``Incident
+#: Number: 18....``) whatever the customer's template says around it. On a
+#: nearly empty page that token IS the refusal, and a browser pass is the
+#: cure; read as a page, the ladder served the refusal at tier 0.
+_EDGE_REF = re.compile(r"(?:reference\s*#|incident\s+(?:number|id)\s*:?)\s*"
+                       r"\d{1,3}\.[0-9a-f]{6,}\.\d{6,}\.[0-9a-f]{4,}", re.I)
 
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 
@@ -383,6 +395,8 @@ def classify(
         for m in _BLOCK_MARKERS_STRONG:
             if m in low:
                 return Verdict(False, blocked=True, vendor=vendor, reason=f"marker:{m}", text_len=n)
+        if _EDGE_REF.search(text):
+            return Verdict(False, blocked=True, vendor=vendor or "akamai", reason="edge_ref", text_len=n)
     for m in _BLOCK_MARKERS_WEAK:
         if m in low and _challenge_dominant(text, m):
             return Verdict(False, blocked=True, vendor=vendor, reason=f"weak:{m}", text_len=n)

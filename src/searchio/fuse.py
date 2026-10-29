@@ -37,7 +37,33 @@ _JUNK_PARAMS = {
     "fbclid", "gclid", "gbraid", "wbraid", "msclkid", "mc_cid", "mc_eid",
     "ref", "ref_", "referrer", "source", "spm", "_ga", "igshid", "yclid",
     "ck_subscriber_id", "sc_channel", "sc_campaign", "trk", "trkCampaign",
+    "msockid",
 }
+
+#: strip_result_trackers: the subset an engine or ad network stamps on a link
+#: on the way out and the page never reads. Narrower than _JUNK_PARAMS on
+#: purpose: ``ref``/``source`` select content on some sites, so a URL handed
+#: back to read keeps them.
+_CLICK_PARAMS = frozenset({
+    "fbclid", "gclid", "gbraid", "wbraid", "msclkid", "msockid", "mc_cid", "mc_eid",
+    "igshid", "yclid", "_ga", "ck_subscriber_id",
+})
+
+
+def strip_trackers(url: str) -> str:
+    """``url`` without its click-tracking parameters; everything else,
+    spelling and order included, is left exactly as it was."""
+    head, sep, query = url.partition("?")
+    if not sep:
+        return url
+    query, hsep, frag = query.partition("#")
+    parts = query.split("&")
+    kept = [kv for kv in parts
+            if not ((k := kv.split("=", 1)[0].lower()) in _CLICK_PARAMS or k.startswith("utm_"))]
+    if len(kept) == len(parts):
+        return url
+    q = "&".join(kept)
+    return head + (f"?{q}" if q else "") + (f"#{frag}" if hsep else "")
 
 _AMAZON_DP = re.compile(r"^(?P<pre>/(?:[^/]+/)?)?(?:dp|gp/product)/(?P<asin>[A-Z0-9]{10})", re.I)
 

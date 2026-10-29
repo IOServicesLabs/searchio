@@ -39,6 +39,8 @@ class _Bucket:
     rate: float
     burst: int
     tokens: float = 0.0
+    #: Per-host rate ceiling (configure); 0 = the limiter's max_rps.
+    ceiling: float = 0.0
     updated: float = field(default_factory=time.monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -93,8 +95,14 @@ class DomainLimiter:
     def rate_for(self, domain: str) -> float:
         return self._bucket(domain).rate
 
-    async def acquire(self, domain: str) -> None:
-        """Block until this domain may be hit again."""
+    async def acquire(self, domain: str, max_wait: float | None = None) -> None:
+        """Block until this domain may be hit again.
+
+        ``max_wait`` (seconds): raise :class:`Throttled` instead of sleeping
+        longer than that. A search provider uses it -- after a few blocks the
+        host's rate sits near FLOOR, and a 10 s sleep inside a 12 s provider
+        timeout is a search spent waiting to be refused.
+        """
         b = self._bucket(domain)
         async with b.lock:
             while True:
@@ -104,6 +112,12 @@ class DomainLimiter:
                     return
                 deficit = 1.0 - b.tokens
                 wait = deficit / max(b.rate, FLOOR)
+                if max_wait is not None and wait > max_wait:
+                    from ..errors import Throttled
+
+                    raise Throttled(
+                        f"local_throttle: {domain} at {b.rate:.2f} rps would wait "
+                        f"{wait:.1f}s > {max_wait:.1f}s")
                 # Jitter breaks up the metronomic timing that makes automated
                 # traffic legible even when every individual request is clean.
                 wait *= 1.0 + random.uniform(-JITTER, JITTER)
@@ -111,7 +125,7 @@ class DomainLimiter:
 
     def record_success(self, domain: str) -> None:
         b = self._bucket(domain)
-        b.rate = min(self.max_rps, b.rate + ADDITIVE)
+        b.rate = min(b.ceiling or self.max_rps, b.rate + ADDITIVE)
 
     def record_block(self, domain: str) -> None:
         b = self._bucket(domain)
@@ -122,6 +136,112 @@ class DomainLimiter:
         b.tokens = 0.0
         b.updated = time.monotonic()
 
+    def snapshot(self, domain: str) -> tuple[float, float]:
+        """(rate, tokens) as of now -- what a record_block would take."""
+        b = self._bucket(domain)
+        b.refill()
+        return b.rate, b.tokens
+
+    def refund(self, domain: str, snap: tuple[float, float]) -> None:
+        """Undo a record_block whose wall a better client then passed in the
+        same climb (wall_refund): the refusal was about the client, not the
+        pace. The rate comes back and so does the burst it surrendered, less
+        one token for the extra request the climb made."""
+        b = self._bucket(domain)
+        b.refill()
+        b.rate = max(b.rate, snap[0])
+        b.tokens = min(float(b.burst), b.tokens + snap[1] - 1.0)
+
+    def configure(self, domain: str, *, rps: float, burst: int) -> None:
+        """Give ``domain`` its own documented rate and burst (api_rate_table).
+        AIMD still moves it -- probing up from ``rps`` to ``max(rps,
+        max_rps)``, halving on a block -- but a per-host ceiling below the
+        global one (arXiv's 1-per-3 s) is never probed past."""
+        b = self._bucket(domain)
+        b.rate = max(FLOOR / 10, float(rps))
+        b.burst = max(int(burst), 1)
+        b.tokens = float(b.burst)
+        b.ceiling = float(rps) if rps < self.default_rps else max(float(rps), self.max_rps)
+        b.updated = time.monotonic()
+
+    def learned(self) -> dict[str, float]:
+        """Hosts whose learned rate sits below the default (persist_rates)."""
+        return {d: b.rate for d, b in self._buckets.items() if b.rate < self.default_rps}
+
+    def seed(self, domain: str, rate: float) -> None:
+        """Start ``domain`` at a rate learned by an earlier process, with no
+        burst in hand -- the same state record_block would have left."""
+        if rate >= self.default_rps:
+            return
+        b = self._bucket(domain)
+        b.rate = max(FLOOR, float(rate))
+        b.tokens = 0.0
+        b.updated = time.monotonic()
+
     def slot(self) -> asyncio.Semaphore:
         """Global concurrency guard, used as an async context manager."""
         return self._sem
+
+
+#: persist_rates: a stored rate recovers this many rps per second of wall
+#: clock (one ADDITIVE step per 10 s idle), so a host that walled us an hour
+#: ago is back at the default by the time it matters.
+RECOVER_RPS_PER_S = ADDITIVE / 10.0
+
+
+class RateStore:
+    """Learned per-domain rates across processes (persist_rates).
+
+    A fresh process otherwise meets a host that walled the last one with a
+    full burst at the default rate, and pays a wall attempt (2-3 s for a
+    search engine) to relearn what the previous process already knew.
+    """
+
+    def __init__(self, path) -> None:
+        from ._sqlite import connect_locked
+
+        self._db = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            db = connect_locked(str(path))
+            db.execute("CREATE TABLE IF NOT EXISTS rates (domain TEXT PRIMARY KEY, rate REAL, at REAL)")
+            db.commit()
+            self._db = db
+        except Exception:  # noqa: BLE001 -- a lost rate store costs one relearn, never a fetch
+            self._db = None
+
+    def load_into(self, limiter: DomainLimiter) -> int:
+        if self._db is None:
+            return 0
+        now = time.time()
+        n = 0
+        try:
+            rows = self._db.execute("SELECT domain, rate, at FROM rates").fetchall()
+        except Exception:  # noqa: BLE001
+            return 0
+        for domain, rate, at in rows:
+            rate = float(rate) + max(0.0, now - float(at)) * RECOVER_RPS_PER_S
+            if rate < limiter.default_rps:
+                limiter.seed(domain, rate)
+                n += 1
+        return n
+
+    def save(self, limiter: DomainLimiter) -> None:
+        if self._db is None:
+            return
+        now = time.time()
+        try:
+            self._db.execute("DELETE FROM rates")
+            for d, r in limiter.learned().items():
+                self._db.execute("INSERT OR REPLACE INTO rates VALUES (?, ?, ?)", (d, r, now))
+            self._db.commit()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close(self) -> None:
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._db = None

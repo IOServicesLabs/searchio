@@ -21,10 +21,11 @@ import datetime as _dt
 import html
 import json
 import re
+import time
 import urllib.parse
 from typing import Any
 
-from ..errors import ProviderError
+from ..errors import ProviderError, RateLimited
 from ..models import Capability, Doc, Query
 from .base import Provider, ProviderContext
 
@@ -116,6 +117,21 @@ def _q(text: str) -> str:
     return urllib.parse.quote_plus(text)
 
 
+def _knob(ctx: ProviderContext, name: str) -> bool:
+    """A batch-5 Settings flag; False for a test ctx without settings."""
+    return bool(getattr(getattr(ctx, "settings", None), name, False))
+
+
+#: lean_api_fields: exactly the fields each parser below reads, so the API
+#: serializes and ships nothing else (an OpenAlex work carries ~14 KB of
+#: authorships, concepts and referenced-works lists the parser never opens).
+_OPENALEX_SELECT = ("id,doi,title,display_name,publication_date,publication_year,"
+                    "primary_location,abstract_inverted_index,cited_by_count,open_access")
+_CROSSREF_SELECT = "URL,title,abstract,issued,DOI,is-referenced-by-count,publisher"
+_HN_FIELDS = ("&attributesToRetrieve=title,url,story_title,story_text,comment_text,"
+              "created_at,points,num_comments&attributesToHighlight=&attributesToSnippet=")
+
+
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -182,6 +198,9 @@ class HackerNews(Provider):
             f"https://hn.algolia.com/api/v1/{endpoint}?query={_q(q.text)}"
             f"&tags={tags}&hitsPerPage={min(q.k, 30)}"
         )
+        if _knob(ctx, "lean_api_fields"):
+            # objectID always comes back; _highlightResult is the bulk.
+            url += _HN_FIELDS
         data = await _json(ctx, url)
         _envelope_error(self.name, data, "hits", "message", "error")
         out = []
@@ -214,8 +233,11 @@ class ArxivProvider(Provider):
     caps = frozenset({Capability.ACADEMIC})
 
     async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
+        # arxiv_https: the http URL answers 301 -> https first, a full extra
+        # round trip (and a second robots host) on every academic search.
+        scheme = "https" if _knob(ctx, "arxiv_https") else "http"
         url = (
-            "http://export.arxiv.org/api/query?search_query=all:"
+            f"{scheme}://export.arxiv.org/api/query?search_query=all:"
             f"{_q(q.text)}&start=0&max_results={min(q.k, 20)}"
             "&sortBy=relevance&sortOrder=descending"
         )
@@ -270,6 +292,8 @@ class OpenAlex(Provider):
             "https://api.openalex.org/works?search="
             f"{_q(q.text)}&per-page={min(q.k, 25)}&sort=relevance_score:desc"
         )
+        if _knob(ctx, "lean_api_fields"):
+            url += "&select=" + _OPENALEX_SELECT
         data = await _json(ctx, url)
         _envelope_error(self.name, data, "results", "error", "message")
         out = []
@@ -316,6 +340,10 @@ class Crossref(Provider):
 
     async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
         url = f"https://api.crossref.org/works?query={_q(q.text)}&rows={min(q.k, 20)}"
+        if _knob(ctx, "lean_api_fields") and not _knob(ctx, "lean_skip_crossref"):
+            # Crossref's select= trims the payload (54 -> 12 KB) but the
+            # server answers it slower (probed 1.6-2.0 s vs 1.1-1.3 s).
+            url += "&select=" + _CROSSREF_SELECT
         data = await _json(ctx, url)
         msg = data.get("message") if isinstance(data, dict) else None
         if not isinstance(data, dict) or data.get("status", "ok") != "ok" or not isinstance(msg, dict):
@@ -396,13 +424,31 @@ class StackExchange(Provider):
 
     name = "stackexchange"
     caps = frozenset({Capability.CODE, Capability.FORUM})
+    #: ratelimit_aware: the API's own "do not ask again before" (monotonic).
+    _not_before: float = 0.0
 
     async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
+        aware = _knob(ctx, "ratelimit_aware")
+        if aware:
+            left = self._not_before - time.monotonic()
+            if left > 0:
+                # Nothing is sent: the API asked for this pause, and asking
+                # anyway is what gets an IP's key-less quota revoked.
+                raise RateLimited(f"stackexchange backoff, {left:.0f}s left", retry_after=left)
         url = (
             "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance"
             f"&q={_q(q.text)}&site=stackoverflow&pagesize={min(q.k, 20)}&filter=default"
         )
         data = await _json(ctx, url)
+        if aware and isinstance(data, dict):
+            # The API's contract: a ``backoff`` field means no request to
+            # this method for that many seconds; quota_remaining 0 means the
+            # day's key-less quota is spent.
+            pause = float(data.get("backoff") or 0)
+            if data.get("quota_remaining") == 0:
+                pause = max(pause, 3600.0)
+            if pause:
+                self._not_before = time.monotonic() + pause
         _envelope_error(self.name, data, "items", "error_message", "error_name")
         out = []
         for i, it in enumerate(data.get("items") or []):
@@ -424,6 +470,42 @@ class StackExchange(Provider):
                         "answers": it.get("answer_count"),
                         "tags": it.get("tags"),
                     },
+                )
+            )
+        return [d for d in out if d.url]
+
+
+class Marginalia(Provider):
+    """Marginalia Search's public API: an independent, keyless web index.
+
+    A third general web engine for when DuckDuckGo walls the egress and
+    Bing answers degraded -- strongest on the text-heavy web (guides,
+    blogs, docs), thin on shopping. Opt-in (``marginalia_enabled``): the
+    shared ``public`` key is rate-limited, and the results are licensed
+    CC-BY-NC-SA 4.0, which a commercial deployment must not take silently.
+    """
+
+    name = "marginalia"
+    caps = frozenset({Capability.WEB})
+    primary_domain = "api.marginalia.nu"
+
+    def configured(self, settings) -> bool:
+        return bool(getattr(settings, "marginalia_enabled", False))
+
+    async def search(self, q: Query, ctx: ProviderContext) -> list[Doc]:
+        url = (f"https://api.marginalia.nu/public/search/"
+               f"{urllib.parse.quote(q.text, safe='')}?count={min(q.k, 20)}")
+        data = await _json(ctx, url)
+        _envelope_error(self.name, data, "results", "error", "message")
+        out = []
+        for i, r in enumerate(data.get("results") or []):
+            out.append(
+                Doc(
+                    url=r.get("url") or "",
+                    title=_plain(r.get("title") or ""),
+                    snippet=_plain(r.get("description") or "")[:300],
+                    source=self.name,
+                    rank=i,
                 )
             )
         return [d for d in out if d.url]

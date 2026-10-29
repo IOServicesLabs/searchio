@@ -48,9 +48,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict, deque
 import ipaddress
+import json
 import os
 import re
 import socket
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -62,6 +64,7 @@ from ..config import Settings, get_settings
 from ..errors import (
     Blocked,
     NavErrorPage,
+    RateLimited,
     SearchioError,
     SidecarUnavailable,
     TargetRefused,
@@ -81,7 +84,7 @@ from .clearance import (
 )
 from .profiles import DomainStore
 from .ratelimit import DomainLimiter
-from .robots import RobotsCache
+from .robots import RobotsCache, RobotsInfo
 from .sessions import SessionStore, SiteSession
 from .sidecar import SidecarClient, default_engine_path
 
@@ -251,8 +254,36 @@ def _resolve_checked(host: str, port: int) -> list:
     them via CURLOPT_RESOLVE -- so a flipped second resolution (TOCTOU)
     never reaches the wire. gaierror (NXDOMAIN and friends) propagates as
     the transport failure it is.
+
+    With ``dns_cache_ttl_s`` set, a vetted answer set is reused for that
+    long: only answers that already passed the check are cached, and the
+    dial still uses exactly the returned set, so the guard's guarantee is
+    unchanged -- it just stops paying a resolver round trip per dial (tier 1
+    resolves on EVERY request to pin libcurl).
     """
-    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if _DNS_TTL[0] > 0:
+        hit = _DNS_CACHE.get((host, port))
+        if hit is not None and hit[0] > time.monotonic():
+            return hit[1]
+    pre = _PRERESOLVED.pop((host, port), None) if _PRERESOLVED else None
+    if pre is not None and pre[0] > time.monotonic():
+        return pre[1]  # vetted moments ago by addrset_tier_memo's lookup
+    try:
+        if _DNS_RACE[0]:
+            # dns_race: the configured servers asked directly, alongside the
+            # OS resolver; the vetting below applies to whichever answers.
+            from .dnsrace import resolve
+
+            infos = resolve(host, port, _DNS_RACE_EXTRA)
+        else:
+            infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except (socket.gaierror, OSError):
+        # dns_stale_if_error: a resolver that times out on a spotty link is
+        # not an answer that the host moved -- dial the last vetted set.
+        last = _DNS_LAST.get((host, port)) if _DNS_STALE[0] else None
+        if last is None:
+            raise
+        return last
     for info in infos:
         try:
             ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
@@ -262,7 +293,188 @@ def _resolve_checked(host: str, port: int) -> list:
         if why:
             raise TargetRefused(
                 f"target_refused: dns:{host} -> {why}")
+    if len(_HOST_ADDRS) >= _DNS_MAX:
+        _HOST_ADDRS.clear()
+    _HOST_ADDRS[host] = tuple(sorted({str(i[4][0]) for i in infos}))
+    if _DNS_TTL[0] > 0:
+        if len(_DNS_CACHE) >= _DNS_MAX:
+            _DNS_CACHE.clear()
+        _DNS_CACHE[(host, port)] = (time.monotonic() + _DNS_TTL[0], infos)
+    if _DNS_STALE[0]:
+        if len(_DNS_LAST) >= _DNS_MAX:
+            _DNS_LAST.clear()
+        _DNS_LAST[(host, port)] = infos
     return infos
+
+
+#: addrset_tier_memo: host -> the exact address set it last resolved to.
+_HOST_ADDRS: dict[str, tuple] = {}
+#: addrset_tier_memo: a lookup made to choose the start tier, handed to the
+#: fetch's own dial once (within 10 s) instead of resolving the name twice.
+_PRERESOLVED: dict[tuple[str, int], tuple[float, list]] = {}
+#: Vetted getaddrinfo answers, (host, port) -> (expires, infos). Process-wide
+#: like the resolver it fronts; the TTL is set by the most recent Ladder.
+_DNS_CACHE: dict[tuple[str, int], tuple[float, list]] = {}
+_DNS_TTL = [0.0]
+_DNS_MAX = 1024
+#: dns_stale_if_error: the last vetted answer per (host, port), any age.
+_DNS_LAST: dict[tuple[str, int], list] = {}
+_DNS_STALE = [False]
+#: dns_race (set by the most recent Ladder, like the TTL) + extra servers.
+_DNS_RACE = [False]
+_DNS_RACE_EXTRA: list[str] = []
+#: dead_ip_ttl_s: ip -> until when it is skipped. An address lands here when
+#: its TCP connect TIMED OUT while the link was demonstrably up (some dial
+#: succeeded within _LINK_ALIVE_S) -- a filtered destination, not a spotty
+#: link. Without it every read of such a host paid each tier's connect
+#: timeout and the same-tier retry (~44 s) and learned nothing for the next.
+_DEAD_IPS: dict[str, float] = {}  # ip -> time.time() expiry
+_DEAD_TTL = [0.0]
+_LAST_DIAL_OK = [0.0]
+_LINK_ALIVE_S = 60.0
+#: (ip, port) of the last address that connected: the link-up probe target.
+_LAST_OK_ADDR: list = [None]
+#: How long the link-up probe may take before the link counts as down.
+_PROBE_S = 1.5
+#: dead_ip_persist: state_dir/dead_ips.json, so a new process (a CLI run, a
+#: restarted server) does not relearn each dead host with a connect timeout.
+_DEAD_PATH: list[Path | None] = [None]
+
+
+def _link_alive(now: float) -> bool:
+    last = _LAST_DIAL_OK[0]
+    if _DEAD_PATH[0] is not None:
+        # A configured remote DNS server answering (dns_race) proves the
+        # link too -- the only proof a fresh process has before its first dial.
+        from . import dnsrace
+
+        last = max(last, dnsrace.LAST_UDP_OK[0])
+    return now - last < _LINK_ALIVE_S
+
+
+def _note_dial(ip: str, ok: bool, port: int = 443) -> None:
+    now = time.monotonic()
+    if ok:
+        _LAST_DIAL_OK[0] = now
+        _LAST_OK_ADDR[0] = (ip, port)
+        if _DEAD_IPS.pop(ip, None) is not None:
+            _save_dead()
+    elif _DEAD_TTL[0] > 0 and _link_alive(now):
+        if len(_DEAD_IPS) >= _DNS_MAX:
+            _DEAD_IPS.clear()
+        _DEAD_IPS[ip] = time.time() + _DEAD_TTL[0]
+        _save_dead()
+
+
+#: dead_host_memo: host -> time.time() expiry. A host whose EVERY offered
+#: address timed out (link proven up) is dead as a NAME too: a CDN rotating
+#: its DNS answers (Akamai: a new address set per query) otherwise handed
+#: the same-tier retry and tier 1 fresh, unmarked addresses -- 8 s each.
+_DEAD_HOSTS: dict[str, float] = {}
+_DEAD_HOST_ON = [False]
+#: link_probe: (host, port) asked when this process has no known-good address
+#: yet -- a fresh CLI run never marked anything, so a dead host cost every
+#: tier's connect timeout and the retries (45 s, b29).
+_LINK_PROBE: list[tuple[str, int] | None] = [None]
+#: link_probe may name SEVERAL targets: all are dialed at once and the first
+#: handshake proves the link (one filtered target -- 1.1.1.1 on this network,
+#: #129 -- cannot sink the proof).
+_LINK_PROBES: list[tuple[str, int]] = []
+
+
+async def _mark_dead_confirmed(ips: list[str], *, proven: bool = False,
+                               host: str | None = None) -> None:
+    """Mark connect-timed-out addresses dead -- only once the link is shown
+    to be up NOW. A recent success is not enough on a spotty link: a drop
+    times out every dial at once, and a CDN address shared by dozens of
+    sites, marked during a drop, failed all of them for the TTL (found live).
+    ``proven``: another address just connected (the host's own fallback)."""
+    if _DEAD_TTL[0] <= 0 or not ips:
+        return
+    if not proven:
+        probe = _LAST_OK_ADDR[0]
+        targets = [probe] if probe is not None else list(_LINK_PROBES)
+        targets = [p for p in targets if p[0] not in ips]
+        if not targets:
+            return  # nothing known-good to ask: never mark blind
+        if not await _any_handshake(targets):
+            return  # the link itself is down: mark nothing
+        _LAST_DIAL_OK[0] = time.monotonic()
+    for ip in ips:
+        _note_dial(ip, False)
+    if host and not proven and _DEAD_HOST_ON[0]:
+        if len(_DEAD_HOSTS) >= _DNS_MAX:
+            _DEAD_HOSTS.clear()
+        _DEAD_HOSTS[host.lower()] = time.time() + _DEAD_TTL[0]
+
+
+async def _any_handshake(targets: list[tuple[str, int]]) -> bool:
+    """True as soon as ANY target completes a TCP handshake within _PROBE_S."""
+    import anyio
+
+    async def one(t):
+        s = await anyio.connect_tcp(t[0], t[1])
+        await s.aclose()
+
+    tasks = [asyncio.ensure_future(one(t)) for t in targets]
+    try:
+        pending = set(tasks)
+        end = time.monotonic() + _PROBE_S
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, timeout=max(0.0, end - time.monotonic()),
+                return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                return False
+            if any(not d.cancelled() and d.exception() is None for d in done):
+                return True
+        return False
+    finally:
+        for t in tasks:
+            t.cancel()
+
+
+def _save_dead() -> None:
+    path = _DEAD_PATH[0]
+    if path is None:
+        return
+    now = time.time()
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({ip: exp for ip, exp in _DEAD_IPS.items() if exp > now}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # a read-only state dir costs the persistence, never the fetch
+
+
+def _load_dead(path: Path) -> None:
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    now = time.time()
+    for ip, exp in (saved.items() if isinstance(saved, dict) else ()):
+        if isinstance(exp, (int, float)) and exp > now:
+            _DEAD_IPS[str(ip)] = min(float(exp), now + _DEAD_TTL[0])
+
+
+def _live_infos(host: str, infos: list) -> list:
+    """The answers minus recently dead addresses; none left -> TransientError
+    now (every address of the host timed out moments ago)."""
+    if _DEAD_TTL[0] <= 0 or not (_DEAD_IPS or _DEAD_HOSTS):
+        return infos
+    now = time.time()
+    if _DEAD_HOSTS.get(host.lower(), 0.0) > now:
+        raise TransientError(
+            f"unreachable: every address of {host} timed out on connect "
+            f"within the last {int(_DEAD_TTL[0])} s (dead_ip_ttl_s)")
+    live = [i for i in infos if _DEAD_IPS.get(i[4][0].split("%", 1)[0], 0.0) <= now]
+    if not live and infos:
+        raise TransientError(
+            f"unreachable: every address of {host} timed out on connect "
+            f"within the last {int(_DEAD_TTL[0])} s (dead_ip_ttl_s)")
+    return live
 
 
 def _resolve_pin(host: str, port: int) -> dict | None:
@@ -281,11 +493,79 @@ def _resolve_pin(host: str, port: int) -> dict | None:
         pass
     from curl_cffi import CurlOpt  # local like the tier1 import (optional dep)
     entries = []
-    for info in _resolve_checked(host, port):
+    for info in _live_infos(host, _resolve_checked(host, port)):
         ip = info[4][0].split("%", 1)[0]
         entries.append(
             f"{host}:{port}:[{ip}]" if ":" in ip else f"{host}:{port}:{ip}")
     return {CurlOpt.RESOLVE: entries} if entries else None
+
+def _rate_limit_wait(status: int, headers) -> float | None:
+    """Seconds until a rate-limited host may be asked again, or None when
+    this response is not a rate limit (ratelimit_aware).
+
+    429 honors Retry-After (seconds or an HTTP date; 60 s when absent). A
+    403 counts only with x-ratelimit-remaining 0 -- GitHub's shape -- and
+    then waits for x-ratelimit-reset (epoch seconds). Clamped to 1 s..1 h.
+    """
+    h = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    wait: float | None = None
+    if status == 429:
+        ra = h.get("retry-after", "").strip()
+        wait = 60.0
+        if ra.isdigit():
+            wait = float(ra)
+        elif ra:
+            from email.utils import parsedate_to_datetime
+
+            try:
+                wait = parsedate_to_datetime(ra).timestamp() - time.time()
+            except (TypeError, ValueError):
+                pass
+    elif status == 403 and h.get("x-ratelimit-remaining", "").strip() == "0":
+        try:
+            wait = float(h.get("x-ratelimit-reset", "")) - time.time()
+        except ValueError:
+            wait = 60.0
+    if wait is None:
+        return None
+    return min(max(wait, 1.0), 3600.0)
+
+
+#: api_rate_table: documented per-IP rates (requests/s, burst) for the API
+#: hosts the providers query. The generic 0.75 rps / burst 3 made a burst of
+#: six searches wait seconds on Wikipedia, which allows far more -- and let
+#: arXiv (1 request per 3 s) and GitHub search (10/min) be over-asked.
+API_RATES: dict[str, tuple[float, int]] = {
+    "en.wikipedia.org": (10.0, 10),
+    "hn.algolia.com": (2.5, 8),
+    "api.openalex.org": (8.0, 10),
+    "api.crossref.org": (5.0, 8),
+    "api.stackexchange.com": (3.0, 6),
+    "api.github.com": (10 / 60, 10),
+    "export.arxiv.org": (1 / 3, 1),
+    "api.marginalia.nu": (1.0, 2),
+}
+
+
+#: serp_tier_hints: hosts whose tier 0 (httpx's TLS fingerprint) is walled
+#: on sight, and the tier that passes them. DDG answers httpx with the
+#: anomaly modal (HTTP 202) on the first request from a fresh profile.
+SERP_TIER_HINTS: dict[str, int] = {
+    "html.duckduckgo.com": 1,
+    "lite.duckduckgo.com": 1,
+}
+
+
+def _first_use_imports() -> None:
+    """The lazy imports a process's first fetches pay, for a worker thread
+    (Ladder.warm, offloop_imports). HTTP/2 first: tier 0 needs it soonest."""
+    import h2.connection  # noqa: F401 -- first-request lazy imports
+    import selectolax.parser  # noqa: F401
+    try:
+        import curl_cffi.requests  # noqa: F401
+    except ImportError:
+        pass
+
 
 # Headers that authenticate the CALLER to one origin. On a redirect hop to
 # a different host (or port -- a different service on the same box), they
@@ -337,6 +617,35 @@ def _hop_headers(headers: dict[str, str], entry_url: str, current: str) -> dict[
 #: ladder must not see each other's tenant) names the jar; nested internal
 #: refetches inherit it.
 _FETCH_SESSION: contextvars.ContextVar[str] = contextvars.ContextVar("searchio_fetch_session", default="")
+#: serp_max_wait_s: the longest a fetch in this context may sleep on the
+#: per-domain limiter before failing Throttled (set by the router around
+#: provider calls; None = wait as long as the limiter says).
+MAX_LIMITER_WAIT: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "searchio_max_limiter_wait", default=None)
+#: serp_swr_s for fetches in this context (set by the router around provider
+#: calls only -- a page read never gets a stale body).
+SERP_SWR: contextvars.ContextVar[float] = contextvars.ContextVar("searchio_serp_swr", default=0.0)
+#: read_slow_kbps: a soft body cap (bytes) for this task's fetches, and a
+#: holder the read marks when it stopped early -- a cut body is never cached.
+#: revalidate_cache: conditional-request headers for this fetch's tier-0 GET.
+COND_HEADERS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "searchio_cond_headers", default=None)
+BODY_SOFT_CAP: contextvars.ContextVar[tuple[int, list] | None] = contextvars.ContextVar(
+    "searchio_body_soft_cap", default=None)
+#: accept_markdown: this task's tier-0 GETs ask for text/markdown first (a
+#: page read only). Sites that negotiate answer with their markdown source;
+#: the rest ignore it and send the HTML. Its own cache variant, so a markdown
+#: body never answers a fetch that did not ask for one.
+ACCEPT_MD: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "searchio_accept_md", default=False)
+#: pdf_read_budget: a page READ keeps only the first ~20 000 characters, so
+#: its PDF extraction stops once it has this many (pypdf spends ~100 ms a
+#: page; an 18-page paper took 2.3 s). A body cut short is never cached --
+#: fetch() and later reads still get, and cache, the whole text.
+PDF_CHAR_BUDGET: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "searchio_pdf_char_budget", default=0)
+_MD_ACCEPT = ("text/markdown,text/html;q=0.9,application/xhtml+xml;q=0.9,"
+              "application/xml;q=0.8,*/*;q=0.7")
 _JARS_MAX = 256
 
 
@@ -432,6 +741,88 @@ class _HopCookies:
         return out
 
 
+#: connect_stagger_ms (seconds): 0 = dial the checked answers one by one.
+_CONNECT_STAGGER = [0.0]
+
+
+async def _staggered_connect(infos, port, timeout, local_address, socket_options,
+                             connect_error, connect_timeout, host=None):
+    """connect_stagger_ms: race dials, a new one every stagger interval.
+
+    The serial loop gave each address the whole connect timeout, and a lost
+    SYN costs the OS retransmit timer (1-3 s) before even the first retry. On
+    a spotty link a second socket, started a few hundred ms later, usually
+    connects at once. The candidates cycle through the CHECKED answers (the
+    same address again when there is one), at most four dials; the first
+    connected stream wins, the rest are cancelled or closed.
+    """
+    import anyio
+
+    stagger = _CONNECT_STAGGER[0]
+    hosts = [info[4][0].split("%", 1)[0] for info in infos]
+    order = [hosts[i % len(hosts)] for i in range(4)]
+
+    async def dial(addr):
+        stream = await anyio.connect_tcp(remote_host=addr, remote_port=port,
+                                         local_host=local_address)
+        for option in (socket_options or []):
+            stream._raw_socket.setsockopt(*option)
+        _note_dial(addr, True, port)
+        return stream
+
+    dialed: list[str] = []
+
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout if timeout else None
+    tasks: list[asyncio.Task] = []
+    errors: list[BaseException] = []
+    tasks_started = 0.0
+    try:
+        while True:
+            if order and (not tasks or len(errors) == len(tasks)
+                          or loop.time() >= tasks_started + stagger):
+                dialed.append(order[0])
+                tasks.append(asyncio.ensure_future(dial(order.pop(0))))
+                tasks_started = loop.time()
+            live = [t for t in tasks if not t.done()]
+            if not live and not order:
+                break
+            marks = [m for m in ((tasks_started + stagger) if order else None, end)
+                     if m is not None]
+            wait = max(0.0, min(marks) - loop.time()) if marks else None
+            done, _ = await asyncio.wait(live or tasks, timeout=wait,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                if t.exception() is None:
+                    winner = t.result()
+                    for other in tasks:
+                        if other is not t:
+                            other.cancel()
+                            other.add_done_callback(_aclose_stream_quietly)
+                    return winner
+                if t.exception() not in errors:
+                    errors.append(t.exception())
+            if end is not None and loop.time() >= end:
+                undone = [addr for t, addr in zip(tasks, dialed) if not t.done()]
+                # The host is dead as a name only when every dial made timed
+                # out (no refusal: a RST proves something is listening there).
+                whole = bool(undone) and not errors and len(undone) == len(dialed)
+                await _mark_dead_confirmed(undone, host=host if whole else None)
+                raise connect_timeout(f"connect timed out after {timeout}s")
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+            t.add_done_callback(_aclose_stream_quietly)
+        raise
+    raise connect_error(str(errors[-1]) if errors else "no usable addresses")
+
+
+def _aclose_stream_quietly(t: "asyncio.Future") -> None:
+    if t.cancelled() or t.exception() is not None:
+        return
+    asyncio.ensure_future(t.result().aclose())
+
+
 def _guarded_async_backend():
     """httpcore's anyio backend with the refused-answer guard on the dial.
 
@@ -456,21 +847,37 @@ def _guarded_async_backend():
             import anyio
             infos = await anyio.to_thread.run_sync(
                 lambda: _resolve_checked(host, port))
+            try:
+                infos = _live_infos(host, infos)
+            except TransientError as exc:
+                raise ConnectError(str(exc)) from None
+            if _CONNECT_STAGGER[0] > 0 and infos:
+                return AnyIOStream(await _staggered_connect(
+                    infos, port, timeout, local_address, socket_options,
+                    ConnectError, ConnectTimeout, host=host))
             last_exc: OSError | None = None
+            timed_out: list[str] = []
             for info in infos:
+                addr = info[4][0].split("%", 1)[0]
                 try:
                     with anyio.fail_after(timeout):
                         stream = await anyio.connect_tcp(
-                            remote_host=info[4][0].split("%", 1)[0],
+                            remote_host=addr,
                             remote_port=port,
                             local_host=local_address,
                         )
                     for option in (socket_options or []):
                         stream._raw_socket.setsockopt(*option)
+                    _note_dial(addr, True, port)
+                    await _mark_dead_confirmed(timed_out, proven=True)
                     return AnyIOStream(stream)
                 except (OSError, anyio.BrokenResourceError,
                         TimeoutError) as exc:
+                    if isinstance(exc, TimeoutError):
+                        timed_out.append(addr)
                     last_exc = exc
+            await _mark_dead_confirmed(
+                timed_out, host=host if infos and len(timed_out) == len(infos) else None)
             if last_exc is None:
                 raise ConnectError(f"no usable addresses for {host}:{port}")
             if isinstance(last_exc, TimeoutError):
@@ -478,6 +885,21 @@ def _guarded_async_backend():
             raise ConnectError(str(last_exc))
 
     return _GuardedAsyncBackend()
+
+
+def _header(headers: dict, name: str) -> str:
+    """Case-insensitive header read (tier 1 keeps the wire's casing)."""
+    for k, v in (headers or {}).items():
+        if k.lower() == name:
+            return str(v)[:300]
+    return ""
+
+
+def _close_quietly(t: "asyncio.Future") -> None:
+    """A hedge loser that still produced a response: close its stream."""
+    if t.cancelled() or t.exception() is not None:
+        return
+    asyncio.ensure_future(t.result().aclose())
 
 
 class _GuardedTransport(httpx.AsyncHTTPTransport):
@@ -605,6 +1027,9 @@ class Ladder:
         self.session_id = session_id or str(int(time.time()))
         #: Per-tenant cheap-tier cookie jars, LRU-bounded (bug 135).
         self._jars: OrderedDict[str, httpx.Cookies] = OrderedDict()
+        #: learn_rendered_first: host -> monotonic expiry of "opens on the
+        #: challenge browser", set when only that browser's rescue got through.
+        self._learned_rf: dict[str, float] = {}
         self._closed = False
         #: Threads for the blocking tiers (bug 140): tier 1 and PDF
         #: extraction ran on the loop's DEFAULT executor -- 8 threads on a
@@ -629,7 +1054,73 @@ class Ladder:
             max_rps=self.s.per_domain_max_rps,
             concurrency=self.s.global_concurrency,
         )
-        self.robots = RobotsCache(self._raw_get, policy=self.s.robots_policy)
+        if getattr(self.s, "api_rate_table", False):
+            for host, (rps, burst) in API_RATES.items():
+                self.limiter.configure(host, rps=rps, burst=burst)
+        #: persist_rates: rates learned by earlier processes seed the limiter.
+        self._rates = None
+        if getattr(self.s, "persist_rates", False):
+            from .ratelimit import RateStore
+
+            self._rates = RateStore(self.s.state_dir / "rates.sqlite")
+            self._rates.load_into(self.limiter)
+        self.robots = RobotsCache(
+            self._raw_get, policy=self.s.robots_policy,
+            store_path=(self.s.state_dir / "robots.sqlite") if self.s.robots_persist else None,
+            nonblocking=self.s.robots_nonblocking,
+        )
+        if self.s.sqlite_fast:
+            for store in (self.cache, self.profiles, self.clearance, self.robots):
+                db = getattr(store, "_db", None)
+                if db is not None:
+                    try:
+                        db.execute("PRAGMA synchronous=NORMAL")
+                    except Exception:  # noqa: BLE001 -- a pragma is never worth a startup
+                        pass
+        #: singleflight: identical concurrent fetches share one climb.
+        self._inflight: dict[tuple, asyncio.Future] = {}
+        #: Background refreshes (serp_swr_s), held against GC; cancelled on close.
+        self._bg: set[asyncio.Task] = set()
+        _DNS_TTL[0] = float(self.s.dns_cache_ttl_s)
+        _DNS_STALE[0] = bool(self.s.dns_stale_if_error)
+        _DNS_RACE[0] = bool(getattr(self.s, "dns_race", False))
+        _DNS_RACE_EXTRA[:] = [x.strip() for x in str(getattr(self.s, "dns_race_servers", "")).split(",")
+                              if x.strip()]
+        _CONNECT_STAGGER[0] = max(0.0, float(self.s.connect_stagger_ms) / 1000.0)
+        _DEAD_TTL[0] = max(0.0, float(getattr(self.s, "dead_ip_ttl_s", 0) or 0))
+        _DEAD_HOST_ON[0] = bool(getattr(self.s, "dead_host_memo", False))
+        from . import sidecar as _sc
+
+        _sc._FAST_PROBE[0] = bool(getattr(self.s, "sidecar_fast_probe", False))
+        from . import dnsrace as _dr
+
+        _dr.NX_FAST[0] = bool(getattr(self.s, "dns_nx_fast", False))
+        _dr.SERVFAIL_FAST[0] = bool(getattr(self.s, "dns_servfail_fast", False))
+        _LINK_PROBE[0] = None
+        _LINK_PROBES.clear()
+        for lp in str(getattr(self.s, "link_probe", "") or "").split(","):
+            lp = lp.strip()
+            if not lp:
+                continue
+            h, _, p = lp.rpartition(":")
+            try:
+                _LINK_PROBES.append((h or lp, int(p) if h else 443))
+            except ValueError:
+                continue
+        _LINK_PROBE[0] = _LINK_PROBES[0] if _LINK_PROBES else None
+        _DEAD_PATH[0] = None
+        if _DEAD_TTL[0] > 0 and getattr(self.s, "dead_ip_persist", False):
+            _DEAD_PATH[0] = Path(self.s.state_dir) / "dead_ips.json"
+            _load_dead(_DEAD_PATH[0])
+        if _DNS_TTL[0] <= 0:
+            _DNS_CACHE.clear()
+        #: tier1_pool: curl_cffi Sessions, one per (worker thread, target).
+        self._cffi_local = threading.local()
+        self._cffi_sessions: list = []
+        #: offloop_imports: the first-use imports, already running on a
+        #: worker thread while the process builds the rest and fans out.
+        self._preimport = (self._pool.submit(_first_use_imports)
+                           if getattr(self.s, "offloop_imports", False) else None)
         if self.s.sidecar_engine:
             # Engine tier 2. A missing binary must surface as a loud,
             # actionable "engine binary not found" at escalation time, never
@@ -671,6 +1162,11 @@ class Ladder:
         self._challenge: SidecarClient | None = challenge_sidecar
 
         self._http: httpx.AsyncClient | None = None
+        #: stall_hedge_ms: a second client with its own pool, so a hedge
+        #: dials a fresh connection instead of queueing behind the stalled one.
+        self._hedge_http: httpx.AsyncClient | None = None
+        #: stall_hedge_ms: per-host time-to-headers EMA (seconds).
+        self._ttfb: dict[str, float] = {}
         self._stats: dict[str, int] = {}
         #: Bounded ring of the last few clearance-capture outcomes, names and
         #: domains only (never values -- cookies are credentials). The 2026-09-18
@@ -678,6 +1174,10 @@ class Ladder:
         #: fine; the old silent return left no way to tell a timing miss from a
         #: jar-snapshot gap, so every non-banking capture now leaves a note.
         self._capture_notes: deque[str] = deque(maxlen=8)
+        #: crawl_delay_interval: per domain, the earliest next request time.
+        self._crawl_next: dict[str, float] = {}
+        #: pdf_reuse_bytes: tier-0 PDF bodies (url -> bytes), newest last.
+        self._pdf_raw: dict[str, bytes] = {}
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -688,6 +1188,8 @@ class Ladder:
         tenant B and to the default tenant). The default tenant's cache stays
         shared, as before."""
         base = "rendered" if rendered else ""
+        if ACCEPT_MD.get():
+            base = f"{base}|md" if base else "md"
         sid = _FETCH_SESSION.get()
         if sid and sid != self.session_id:
             return f"{base}|s:{sid}" if base else f"s:{sid}"
@@ -715,6 +1217,38 @@ class Ladder:
         rendered: bool = False,
         session: str = "",
     ) -> FetchResult:
+        """Retrieve ``url`` for one tenant; see :meth:`_fetch_shared`.
+
+        stale_if_error_s: a fetch the NETWORK failed (a transient error --
+        never a block, a robots refusal or a policy refusal) is answered
+        from an expired cache entry up to that many seconds past its TTL.
+        On a link that drops out, a page read an hour ago beats an error.
+        """
+        try:
+            return await self._fetch_shared(
+                url, max_tier=max_tier, force_tier=force_tier, use_cache=use_cache,
+                referer=referer, rendered=rendered, session=session)
+        except TransientError as exc:
+            grace = self.s.stale_if_error_s
+            if (grace <= 0 or not use_cache or isinstance(exc, (TargetRefused, RateLimited))):
+                raise
+            stale = self.cache.get(url, variant=self._cache_variant(rendered), stale_for=grace)
+            if not stale:
+                raise
+            self._bump("cache_stale_if_error")
+            return FetchResult(**{**stale, "from_cache": True, "via": "cache-stale-error"})
+
+    async def _fetch_shared(
+        self,
+        url: str,
+        *,
+        max_tier: int | None = None,
+        force_tier: int | None = None,
+        use_cache: bool = True,
+        referer: str = "",
+        rendered: bool = False,
+        session: str = "",
+    ) -> FetchResult:
         """Retrieve ``url`` for one tenant; see :meth:`_fetch`.
 
         ``session`` names the tenant whose cheap-tier cookie jar this fetch
@@ -728,8 +1262,48 @@ class Ladder:
             raise RuntimeError("Ladder is closed")
         tok = _FETCH_SESSION.set(session or _FETCH_SESSION.get() or self.session_id)
         try:
-            return await self._fetch(url, max_tier=max_tier, force_tier=force_tier,
-                                     use_cache=use_cache, referer=referer, rendered=rendered)
+            # A host with a seeded session is never coalesced: each request
+            # under a login jar may rotate it (docs/SESSIONS.md 3.5), and
+            # merging N fetches into one would drop N-1 rotations.
+            if not self.s.singleflight or self.sessions.for_host(domain_of(url)) is not None:
+                return await self._fetch(url, max_tier=max_tier, force_tier=force_tier,
+                                         use_cache=use_cache, referer=referer,
+                                         rendered=rendered)
+            # Identical concurrent fetches -- same URL, same tenant, same
+            # knobs -- share one climb: a swarm's workers searching the same
+            # thing used to send the same SERP request N times, each paying
+            # the limiter and each a fresh block signal.
+            key = (url, max_tier, force_tier, use_cache, referer, rendered,
+                   _FETCH_SESSION.get())
+            while True:
+                fut = self._inflight.get(key)
+                if fut is None:
+                    break
+                # wait(), not shield(): a LEADER that was cancelled (a hedge
+                # loser, a timed-out provider) must not cancel its waiters --
+                # they take the climb over themselves.
+                await asyncio.wait({fut})
+                if not fut.cancelled():
+                    return fut.result().model_copy(deep=True)
+            fut = asyncio.get_running_loop().create_future()
+            self._inflight[key] = fut
+            try:
+                res = await self._fetch(url, max_tier=max_tier, force_tier=force_tier,
+                                        use_cache=use_cache, referer=referer,
+                                        rendered=rendered)
+            except asyncio.CancelledError:
+                fut.cancel()
+                raise
+            except BaseException as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+                    fut.exception()  # retrieved: no waiter is not an error
+                raise
+            finally:
+                self._inflight.pop(key, None)
+            if not fut.done():
+                fut.set_result(res)
+            return res
         finally:
             _FETCH_SESSION.reset(tok)
 
@@ -782,8 +1356,66 @@ class Ladder:
             hit = self.cache.get(url, variant=self._cache_variant(rendered))
             if hit:
                 return FetchResult(**{**hit, "from_cache": True, "via": "cache"})
+            swr = SERP_SWR.get()
+            if swr > 0:
+                stale = self.cache.get(url, variant=self._cache_variant(rendered), stale_for=swr)
+                if stale:
+                    # Stale-while-revalidate (search fetches only): the
+                    # expired SERP answers now; a background refetch -- same
+                    # tenant, same knobs, via the singleflight path so a
+                    # burst refreshes once -- replaces it for the next ask.
+                    self._bump("cache_stale_served")
 
-        rinfo = await self.robots.check(url)
+                    async def refresh() -> None:
+                        # A normal cached fetch with SWR off in this task's
+                        # context: the fresh read misses (expired), the climb
+                        # runs, and the success path writes the cache.
+                        SERP_SWR.set(0.0)
+                        await self.fetch(url, max_tier=max_tier, force_tier=force_tier,
+                                         referer=referer, rendered=rendered)
+
+                    t = asyncio.ensure_future(refresh())
+                    self._bg.add(t)
+                    t.add_done_callback(self._bg_done)
+                    return FetchResult(**{**stale, "from_cache": True, "via": "cache-stale"})
+
+        if (self.s.robots_skip_apis and self.s.robots_policy != "enforce"
+                and dom in API_RATES):
+            # A documented JSON API is called as its docs say, not crawled:
+            # its robots.txt (often a 404, or a site-wide file that only
+            # annotates under warn) is not worth a request on first contact.
+            rinfo = RobotsInfo(allowed=True, checked=False, reason="api_host")
+        else:
+            rinfo = await self.robots.check(url)
+        # revalidate_cache: an expired entry with validators is re-asked
+        # conditionally (tier 0); a 304 below answers from it.
+        cond_stale = None
+        cond_tok = None
+        if use_cache and self.s.revalidate_cache:
+            old = self.cache.get(url, variant=self._cache_variant(rendered),
+                                 stale_for=self.s.revalidate_max_age_s)
+            if old and (old.get("etag") or old.get("last_modified")):
+                cond = {}
+                if old.get("etag"):
+                    cond["If-None-Match"] = old["etag"]
+                if old.get("last_modified"):
+                    cond["If-Modified-Since"] = old["last_modified"]
+                cond_stale = old
+                cond_tok = COND_HEADERS.set(cond)
+        try:
+            res = await self._climb(url, dom, ceiling, rinfo, max_tier=max_tier,
+                                    force_tier=force_tier, use_cache=use_cache,
+                                    referer=referer, rendered=rendered, started=started,
+                                    cond_stale=cond_stale)
+            if getattr(self.s, "addrset_tier_memo", False) and not res.from_cache:
+                self._addrset_learn(url, res)
+            return res
+        finally:
+            if cond_tok is not None:
+                COND_HEADERS.reset(cond_tok)
+
+    async def _climb(self, url, dom, ceiling, rinfo, *, max_tier, force_tier, use_cache,
+                     referer, rendered, started, cond_stale):
         if not self.robots.permits(rinfo):
             raise Blocked("disallowed_by_robots", vendor="robots")
 
@@ -801,6 +1433,11 @@ class Ladder:
                 raise Blocked("disallowed_by_robots", vendor="robots")
 
         start = force_tier if force_tier is not None else self.profiles.start_tier(dom, ceiling)
+        if force_tier is None and getattr(self.s, "serp_tier_hints", False):
+            start = self._hinted_start(dom, start, ceiling)
+        if (force_tier is None and start == 0 and ceiling >= 1 and not rendered
+                and getattr(self.s, "addrset_tier_memo", False)):
+            start = await self._addrset_start(url, dom)
         if force_tier is None and _FETCH_SESSION.get() not in ("", self.session_id) and start > 0:
             # A tenant-scoped fetch starts at the ISOLATED tiers (bug 136):
             # the domain profile learns to begin at the browser after a
@@ -823,9 +1460,8 @@ class Ladder:
             force_tier is None
             and not rendered
             and 2 <= ceiling
-            and start < 2
             and _FETCH_SESSION.get() in ("", self.session_id)
-            and self._rendered_first(dom)
+            and ((start < 2 and self._rendered_first(dom)) or self._learned_first(dom))
         )
 
         def advance() -> None:
@@ -834,6 +1470,7 @@ class Ladder:
             nonlocal tier, rendered_pass, fallback_pending
             if fallback_pending:
                 fallback_pending = False
+                self._learned_rf.pop(dom, None)  # the browser-first pass failed: unlearn
                 tier, rendered_pass = start, bool(rendered)
             else:
                 tier += 1
@@ -875,16 +1512,54 @@ class Ladder:
         fallback_pending = opener
 
         tier = 2 if opener else start
+        #: escalate_no_wait: the attempt right after a block (the climb to a
+        #: better client, or the jar retry) is the SAME logical request; the
+        #: block's backoff governs the host's next fetches, not this one.
+        permit_paid = False
+        #: wall_refund: the limiter's state just before this climb's first
+        #: block, handed back if a higher tier then passes.
+        wall_snap: tuple[float, float] | None = None
         while tier <= ceiling:
+            if tier == 2 and getattr(self.s, "skip_dead_tier", False):
+                # skip_dead_tier: a sidecar already found unreachable is
+                # sticky (SidecarClient.available) -- the attempt would fail
+                # at once, so it must not first wait out the host's permit
+                # (~2.7 s after a block) to learn that again.
+                client = self._client_for(rendered_pass)
+                if not client.available:
+                    escalations.append(f"tier{tier}:sidecar_unavailable")
+                    last_transient = SidecarUnavailable(client._unavailable_reason)
+                    advance()
+                    continue
             # The per-domain permit and the crawl delay come BEFORE the global
             # slot (bug 139): held inside it, callers queued on one throttled
             # host occupied every slot while they slept, and an unrelated
             # host waited seconds for nothing. The slot bounds in-flight
             # network work only.
-            await self.limiter.acquire(dom)
+            # The bound rides only when set: test doubles override acquire
+            # with the old one-argument signature (the conditional-kwarg rule).
+            max_wait = MAX_LIMITER_WAIT.get()
+            if permit_paid:
+                permit_paid = False
+            elif max_wait is None:
+                await self.limiter.acquire(dom)
+            else:
+                await self.limiter.acquire(dom, max_wait)
             if rinfo.crawl_delay:
                 # A host that states a crawl-delay has told us its price.
-                await asyncio.sleep(min(rinfo.crawl_delay, 10.0))
+                delay = min(rinfo.crawl_delay, 10.0)
+                if getattr(self.s, "crawl_delay_interval", False):
+                    # crawl_delay_interval: the delay is the GAP between two
+                    # requests to the host, not a toll on each one. The slot
+                    # is reserved before sleeping, so concurrent fetches queue
+                    # one delay apart -- the same rate cap, no idle first wait.
+                    now = time.monotonic()
+                    nxt = self._crawl_next.get(dom, 0.0)
+                    self._crawl_next[dom] = max(now, nxt) + delay
+                    if nxt > now:
+                        await asyncio.sleep(nxt - now)
+                else:
+                    await asyncio.sleep(delay)
             attempt_started = time.time()
             async with self.limiter.slot():
                 try:
@@ -958,10 +1633,70 @@ class Ladder:
                     continue
 
             status, headers, body, ctype, final_url = res
+            if status == 304 and cond_stale is not None:
+                # Unchanged: the cached body is current. Re-put it so its
+                # TTL restarts, and answer without a body on the wire.
+                self._bump("cache_revalidated")
+                self._cache_put(url, {**cond_stale}, variant=self._cache_variant(rendered),
+                                tier=cond_stale.get("tier", 0))
+                return FetchResult(**{**cond_stale, "from_cache": True,
+                                      "via": "cache-revalidated"})
             verdict = classify(
                 status, headers, body, content_type=ctype, min_text=self.s.min_text_chars
             )
             seen_vendor = seen_vendor or verdict.vendor
+            if (
+                tier == 0
+                and not verdict.ok
+                and not verdict.blocked
+                and ACCEPT_MD.get()
+                and getattr(self.s, "md_stub_passthrough", False)
+                and 200 <= status < 300
+                and "markdown" in (ctype or "").lower()
+                and verdict.reason.startswith(("too_thin", "empty_mount"))
+            ):
+                # md_stub_passthrough: a host that negotiates markdown can
+                # answer an index page with a stub ("# Get started", 16 bytes
+                # on docs.docker.com, whose HTML is 182 KB). That is not a JS
+                # shell -- the HTML variant is complete -- so hand the stub
+                # to the caller (Engine.read re-reads as HTML) instead of
+                # climbing to tiers that would ask for the same markdown.
+                # Never cached: the md variant must not pin a stub.
+                self._bump("md_stub_passthrough")
+                return FetchResult(
+                    url=url, final_url=final_url or url, status=status, body=body,
+                    content_type=ctype, tier=tier, via=TIER_NAMES.get(tier, str(tier)),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    escalations=escalations + [f"tier{tier}:{verdict.reason}", "md_stub"],
+                    rendered=False,
+                )
+            if getattr(self.s, "ratelimit_aware", False) and (
+                    dom in API_RATES or MAX_LIMITER_WAIT.get() is not None
+                    or not getattr(self.s, "ratelimit_api_only", False)):
+                # ratelimit_api_only: a documented API's or a search
+                # provider's 429/503 is a quota (providers bound their permit
+                # wait, MAX_LIMITER_WAIT). A PAGE read's 429 may be an anti-
+                # bot challenge (the rendered-first opener class serves
+                # content only after browser-grade behavior), so page reads
+                # keep the climb and per-tier backoff.
+                wait = _rate_limit_wait(status, headers)
+                if (wait is None and status == 503 and getattr(self.s, "ratelimit_503", False)
+                        and not verdict.blocked and "challenge" not in verdict.reason):
+                    # ratelimit_503: a 503 that states Retry-After is "come
+                    # back in N s" (Wikimedia's per-IP API limit: 503 +
+                    # Retry-After 41, found live) -- every tier asks the same
+                    # server, so climbing only re-asks a host that said wait.
+                    ra = next((str(v).strip() for k, v in (headers or {}).items()
+                               if str(k).lower() == "retry-after"), "")
+                    if ra.isdigit():
+                        wait = min(max(float(ra), 1.0), 3600.0)
+                if wait is not None:
+                    # A per-IP quota: every tier draws the same answer, and a
+                    # 403 must not pin the host's profile above tier 0.
+                    self.limiter.record_block(dom)
+                    self._bump(f"tier{tier}_rate_limited")
+                    raise RateLimited(f"rate_limited: {dom} ({status}), retry in {wait:.0f}s",
+                                      retry_after=wait)
 
             # PDF interception: classify just told us the bytes are a PDF
             # (envelope content-type or body magic). The tier contract hands
@@ -1005,9 +1740,10 @@ class Ladder:
                     # A jar ever attached means this body was read as a
                     # logged-in identity: private page, never shared-cache
                     # material (bug 138's shape, one tier up).
-                    if use_cache and session is None:
-                        self.cache.put(url, out.model_dump(exclude={"from_cache"}),
-                                       variant=self._cache_variant(rendered), tier=tier)
+                    budget_cut = PDF_CHAR_BUDGET.get() > 0 and stamp.endswith(":capped")
+                    if use_cache and session is None and not budget_cut:
+                        self._cache_put(url, out.model_dump(exclude={"from_cache"}),
+                                        variant=self._cache_variant(rendered), tier=tier)
                     return out
                 # Extraction failed (scanned, rotten, oversized, refetch drew
                 # a wall): record the honest reason and climb. PDF reasons
@@ -1017,6 +1753,12 @@ class Ladder:
                 continue
 
             if verdict.ok:
+                if wall_snap is not None and tier > last_block_tier:
+                    # A better client passed the wall the cheaper one drew:
+                    # that 403 judged the fingerprint, not our pace, and must
+                    # not tax the host's next reads (~2 s each at tier 1).
+                    self.limiter.refund(dom, wall_snap)
+                    wall_snap = None
                 self.limiter.record_success(dom)
                 self.profiles.record_success(dom, tier)
                 self._bump(f"tier{tier}_ok")
@@ -1037,6 +1779,9 @@ class Ladder:
                 )
                 if served_rendered:
                     self._bump("tier2_rendered")
+                    if (getattr(self.s, "learn_rendered_first", False)
+                            and (opener or "tier2:auto_rendered" in escalations)):
+                        self._learned_rf[dom] = time.monotonic() + self.s.learn_rendered_first_ttl_s
                 if tier == 2:
                     # The browser just paid for a challenge. Bank the cookie
                     # so the next page on this host costs a tier-1 request.
@@ -1053,13 +1798,15 @@ class Ladder:
                     elapsed_ms=int((time.monotonic() - started) * 1000),
                     escalations=escalations,
                     rendered=served_rendered,
+                    etag=_header(headers, "etag"),
+                    last_modified=_header(headers, "last-modified"),
                 )
                 # A jar ever attached means this body was read as a logged-in
                 # identity: private page, never shared-cache material (bug
                 # 138's shape, one tier up).
                 if use_cache and session is None:
-                    self.cache.put(url, out.model_dump(exclude={"from_cache"}),
-                                   variant=self._cache_variant(rendered), tier=tier)
+                    self._cache_put(url, out.model_dump(exclude={"from_cache"}),
+                                    variant=self._cache_variant(rendered), tier=tier)
                 return out
 
             escalations.append(f"tier{tier}:{verdict.reason}")
@@ -1109,9 +1856,14 @@ class Ladder:
                     # (bug 143): one banked meanwhile by another caller's
                     # rescue is not the one that drew the 403.
                     self.clearance.drop(dom, older_than=attempt_started)
+                if (wall_snap is None and getattr(self.s, "wall_refund", False)
+                        and hasattr(self.limiter, "snapshot")):
+                    wall_snap = self.limiter.snapshot(dom)
                 self.limiter.record_block(dom)
                 self.profiles.record_block(dom, tier, verdict.vendor or "")
                 self._bump(f"tier{tier}_blocked")
+                if getattr(self.s, "escalate_no_wait", False):
+                    permit_paid = True
                 last_block = Blocked(verdict.reason, verdict.vendor or seen_vendor, status)
                 last_block_tier = tier
             else:
@@ -1179,6 +1931,42 @@ class Ladder:
                 self._bump("session_retry")
                 continue
 
+            if (
+                tier == 0
+                and not fallback_pending
+                and getattr(self.s, "thin_skip_tier1", False)
+                and not verdict.blocked
+                and 200 <= status < 300
+                and verdict.reason.startswith(("too_thin", "empty_mount"))
+            ):
+                # thin_skip_tier1: a 2xx JS shell is the same shell to every
+                # client that does not run JS -- 0 of 35 thin tier-0 pages in
+                # a 412-URL corpus scan read better at tier 1 (2026-10-27).
+                # Straight to the browser (or the thin fallback); no tier-1
+                # round trip, no tier-1 permit.
+                escalations.append("tier1:skipped_js_shell")
+                tier = 1
+
+            if (
+                tier == 0
+                and not fallback_pending
+                and getattr(self.s, "decisive_404", False)
+                and status in (404, 410)
+                and not verdict.blocked
+                and (not (verdict.vendor or seen_vendor)
+                     or (getattr(self.s, "decisive_404_cdn", False)
+                         and not _looks_like_challenge(
+                             body, {str(k).lower(): (v or "") for k, v in headers.items()})))
+            ):
+                # decisive_404_cdn: a CDN name on a 404 is mostly just the
+                # Server header (134 cloudflare, 6 akamai, 1 datadome in a
+                # 460-host scan) -- 141 of 141 answered tier 1 the same.
+                # decisive_404: the page does not exist. A plain 404/410 (no
+                # wall vendor) is the site's answer to every client -- 73 of
+                # 73 hosts in a scan answered tier 1 the same (2026-10-27);
+                # climbing only bought a browser launch for a missing page.
+                break
+
             advance()
 
         # A block only outranks the thin page when it came from the thin
@@ -1240,10 +2028,30 @@ class Ladder:
 
     async def close(self) -> None:
         self._closed = True
+        for t in list(getattr(self, "_bg", ())):
+            t.cancel()
+        # Write-behind puts are already on a thread: let them land before
+        # the cache connection closes under them.
+        writes = list(getattr(self, "_writes", ()))
+        if writes:
+            await asyncio.gather(*writes, return_exceptions=True)
         self._pool.shutdown(wait=False)
+        sessions = getattr(self, "_cffi_sessions", [])
+        for sess in sessions:
+            try:
+                sess.close()
+            except Exception:  # noqa: BLE001 -- closing a keep-alive is best effort
+                pass
+        sessions.clear()
+        close_robots = getattr(self.robots, "close", None)
+        if close_robots:
+            close_robots()
         if self._http:
             await self._http.aclose()
             self._http = None
+        if self._hedge_http:
+            await self._hedge_http.aclose()
+            self._hedge_http = None
         # The challenge sidecar is only ever ours when it is a distinct
         # client; when it de-duplicates to the primary, one close suffices.
         if self._challenge is not None and self._challenge is not self.sidecar:
@@ -1251,10 +2059,133 @@ class Ladder:
             self._challenge = None
         if getattr(self, "_owns_sidecar", True):
             await self.sidecar.close()
+        rates = getattr(self, "_rates", None)
+        if rates is not None:
+            rates.save(self.limiter)
+            rates.close()
         self.cache.close()
         self.profiles.close()
         self.clearance.close()
         self.sessions.close()
+
+    def _addrset_learn(self, url: str, res) -> None:
+        """addrset_tier_memo: tally, per exact address set, hosts whose tier-0
+        GET was refused (403/429) and tier 1 served vs hosts tier 0 served."""
+        key = _HOST_ADDRS.get(urlsplit(url).hostname or "")
+        if not key:
+            return
+        memo = self.__dict__.setdefault("_addrsets", {})
+        if len(memo) >= 1024:
+            memo.clear()
+        tally = memo.setdefault(key, [set(), set()])
+        host = urlsplit(url).hostname or ""
+        if res.tier == 1 and any(e in ("tier0:http_403", "tier0:http_429")
+                                 for e in res.escalations):
+            tally[0].add(host)
+        elif res.tier == 0:
+            tally[1].add(host)
+
+    async def _addrset_start(self, url: str, dom: str) -> int:
+        """addrset_tier_memo: a host never seen before, on the exact address
+        set where >=2 other hosts drew a tier-0 403 that tier 1 passed (and
+        none was served at tier 0), opens at tier 1. One CDN zone fronting a
+        publisher's whole network (22 Dotdash Meredith sites share one
+        Cloudflare pair in a 460-host scan, all 22 tier-0 403 -> tier 1 ok)
+        refuses tier 0 identically; a mixed set never triggers."""
+        memo = self.__dict__.get("_addrsets")
+        if not memo or not any(len(a) >= 2 and not b for a, b in memo.values()):
+            return 0
+        p = self.profiles.get(dom)
+        if p.successes or p.blocks:
+            return 0  # its own history rules
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        key = _HOST_ADDRS.get(host)
+        if key is None:
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+            try:
+                infos = await asyncio.to_thread(_resolve_checked, host, port)
+            except Exception:  # noqa: BLE001 -- the dial reports it honestly
+                return 0
+            if len(_PRERESOLVED) >= 64:
+                _PRERESOLVED.clear()
+            _PRERESOLVED[(host, port)] = (time.monotonic() + 10.0, infos)
+            key = _HOST_ADDRS.get(host)
+        tally = memo.get(key) if key else None
+        if tally and len(tally[0] - {host}) >= 2 and not tally[1]:
+            self._bump("addrset_tier1")
+            return 1
+        return 0
+
+    def _hinted_start(self, dom: str, start: int, ceiling: int) -> int:
+        """serp_tier_hints: a host in SERP_TIER_HINTS starts at its hinted
+        tier until its own profile has seen it at all. Once the profile has
+        a success or a block, the learned answer (and its probes) rules."""
+        hint = SERP_TIER_HINTS.get(dom, 0)
+        if hint <= start or hint > ceiling:
+            return start
+        p = self.profiles.get(dom)
+        if p.successes or p.blocks:
+            return start
+        return hint
+
+    def _cache_put(self, url: str, value, variant: str, tier: int) -> None:
+        soft = BODY_SOFT_CAP.get()
+        if soft is not None and soft[1]:
+            return  # a soft-capped body is a partial page: never cached
+        """Store a fetched page; with ``cache_write_behind`` the SQLite
+        write (JSON encode + INSERT + commit, ~1-5 ms for a large SERP)
+        runs on a worker thread instead of holding the loop while the
+        other providers' responses wait to be handled."""
+        if not getattr(self.s, "cache_write_behind", False):
+            self.cache.put(url, value, variant=variant, tier=tier)
+            return
+        writes = self.__dict__.setdefault("_writes", set())
+        t = asyncio.ensure_future(
+            asyncio.to_thread(self.cache.put, url, value, variant, tier))
+        writes.add(t)
+        t.add_done_callback(writes.discard)
+
+    def _bg_done(self, t: asyncio.Task) -> None:
+        self._bg.discard(t)
+        if not t.cancelled():
+            t.exception()  # a failed refresh leaves the stale entry; never "unretrieved"
+
+    def _note_ttfb(self, dom: str, seconds: float) -> None:
+        prev = self._ttfb.get(dom)
+        self._ttfb[dom] = seconds if prev is None else 0.7 * prev + 0.3 * seconds
+
+    #: Link throughput estimate (KB/s EMA from tier-0 body transfers), or
+    #: None before a body large enough to measure has arrived.
+    link_kbps: float | None = None
+
+    def _note_transfer(self, nbytes: int, seconds: float) -> None:
+        """Bodies of 32 KB+ time the link itself (headers already in hand,
+        so server think-time is excluded); smaller ones are all latency."""
+        if nbytes < 32 * 1024 or seconds <= 0.005:
+            return
+        kbps = nbytes / 1024 / seconds
+        self.link_kbps = kbps if self.link_kbps is None else 0.6 * self.link_kbps + 0.4 * kbps
+
+    async def warm(self, origins: list[str]) -> None:
+        """Pay first-use costs before the first fetch needs them.
+
+        The first fetch of a process used to block the loop ~250 ms on lazy
+        imports and TLS-context construction while the other providers'
+        calls waited to start, then pay a serial robots.txt round trip and a
+        TLS handshake per host. Here: the client is built, the parsers are
+        imported, and every origin's robots.txt is read -- through the same
+        pooled client, so each host is left holding a live connection the
+        first real request reuses (within ``http_keepalive_s``). Best
+        effort: a failure here is a cold first fetch, never an error.
+        """
+        try:
+            await asyncio.get_running_loop().run_in_executor(self._pool, _first_use_imports)
+            await self._client()
+            await asyncio.gather(*(self.robots.check(o.rstrip("/") + "/") for o in origins),
+                                 return_exceptions=True)
+        except Exception:  # noqa: BLE001 -- warm-up is an optimization
+            pass
 
     def stats(self) -> dict[str, Any]:
         return {
@@ -1348,6 +2279,19 @@ class Ladder:
             and (self.s.sidecar_challenge or "patchright").strip().lower() == "patchright"
         )
 
+    def _learned_first(self, dom: str) -> bool:
+        """learn_rendered_first: this host's last read got through only on
+        the challenge browser's rescue, recently enough to open there."""
+        if not getattr(self.s, "learn_rendered_first", False):
+            return False
+        exp = self._learned_rf.get(dom)
+        if exp is None:
+            return False
+        if exp > time.monotonic():
+            return True
+        self._learned_rf.pop(dom, None)
+        return False
+
     def _rendered_first(self, dom: str) -> bool:
         """Whether this domain opens on the challenge sidecar (Settings'
         ``rendered_first_domains``; the adaptive class, see the config
@@ -1391,7 +2335,42 @@ class Ladder:
             request_timeout_s=self.s.tier2_timeout_s,
         )
 
+    def _build_client(self, *, http2: bool) -> httpx.AsyncClient:
+        timeout: float | httpx.Timeout = self.s.tier0_timeout_s
+        if self.s.connect_timeout_s > 0 or self.s.read_stall_s > 0:
+            cap = self.s.tier0_timeout_s
+            timeout = httpx.Timeout(
+                cap,
+                connect=min(self.s.connect_timeout_s or cap, cap),
+                # read_stall_s: the gap allowed between body chunks. A body
+                # stalled mid-transfer on a spotty link fails fast into the
+                # ladder's immediate same-tier retry on a new connection.
+                read=min(self.s.read_stall_s or cap, cap))
+        return httpx.AsyncClient(
+            transport=_GuardedTransport(
+                http2=http2, proxy=self.s.proxy or None,
+                retries=max(0, int(self.s.connect_retries)),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20,
+                                    keepalive_expiry=self.s.http_keepalive_s)),
+            follow_redirects=True,
+            max_redirects=self.s.max_redirects,
+            timeout=timeout,
+        )
+
+    async def _hedge_client(self) -> httpx.AsyncClient:
+        if self._hedge_http is None:
+            # Same protocol as the main client (a Chrome persona over
+            # HTTP/1.1 draws 403s -- Wikimedia), but its own pool: the
+            # hedge cannot queue behind the stalled connection.
+            self._hedge_http = self._build_client(http2=bool(self.s.tier0_http2))
+        return self._hedge_http
+
     async def _client(self) -> httpx.AsyncClient:
+        if (self.s.tier0_http2 is False or self.s.connect_timeout_s > 0
+                or self.s.connect_retries > 0 or self.s.read_stall_s > 0):
+            if self._http is None:
+                self._http = self._build_client(http2=bool(self.s.tier0_http2))
+            return self._http
         if self._http is None:
             # The guarded transport owns the dial (bug 27): every hop of
             # every tier-0 request resolves through _resolve_checked and
@@ -1400,7 +2379,9 @@ class Ladder:
             # supplied; timeout/redirect policy stay client-level.
             self._http = httpx.AsyncClient(
                 transport=_GuardedTransport(
-                    http2=True, proxy=self.s.proxy or None),
+                    http2=True, proxy=self.s.proxy or None,
+                    limits=httpx.Limits(max_connections=100, max_keepalive_connections=20,
+                                        keepalive_expiry=self.s.http_keepalive_s)),
                 follow_redirects=True,
                 max_redirects=self.s.max_redirects,
                 timeout=self.s.tier0_timeout_s,
@@ -1417,7 +2398,11 @@ class Ladder:
         caller deserves to know exactly which step refused.
         """
         try:
-            data = await self._fetch_bytes(url)
+            data = self._pdf_raw.pop(url, None)
+            if data is not None:
+                self._bump("pdf_bytes_reused")
+            else:
+                data = await self._fetch_bytes(url)
         except pdf_mod.PdfTooLarge:
             return None, "pdf_text:too_large"
         except TargetRefused:
@@ -1433,7 +2418,8 @@ class Ladder:
             return None, "pdf_text:not_pdf_bytes"
         try:
             text, used, total = await asyncio.get_running_loop().run_in_executor(
-                self._pool, pdf_mod.extract_text, data, self.s.pdf_max_pages)
+                self._pool, pdf_mod.extract_text, data, self.s.pdf_max_pages,
+                PDF_CHAR_BUDGET.get())
         except pdf_mod.PdfUnreadable:
             return None, "pdf_text:unreadable"
         if not text.strip():
@@ -1495,15 +2481,72 @@ class Ladder:
                 f"too_large: content-length {cl} exceeds cap {cap}")
         chunks: list[bytes] = []
         total = 0
+        soft = BODY_SOFT_CAP.get()
         async for chunk in r.aiter_bytes(65536):
             total += len(chunk)
             if total > cap:
                 raise TransientError(
                     f"too_large: decoded body exceeds cap {cap}")
             chunks.append(chunk)
+            if soft is not None and total >= soft[0]:
+                # A slow link and a long page: the article is near the top,
+                # and the rest would cost seconds per 100 KB.
+                soft[1].append(total)
+                self._bump("body_soft_capped")
+                break
         return b"".join(chunks)
 
-    async def _open_stream(self, url: str, headers: dict, timeout: float) -> httpx.Response:
+    async def _open_hedged(self, url: str, headers: dict, timeout: float) -> httpx.Response:
+        """stall_hedge_ms: when no response headers arrive in time, send the
+        same GET again on the hedge client's fresh connection and keep the
+        first answer. On a lossy link one dropped packet stalls a TCP stream
+        -- and with HTTP/2 every request multiplexed on it -- for a
+        retransmit timeout or the whole tier timeout; a new connection
+        usually answers at once. The loser is cancelled or closed."""
+        wait = self.s.stall_hedge_ms / 1000.0
+        if wait <= 0:
+            return await self._open_stream(url, headers, timeout)
+        dom = domain_of(url)
+        ttfb = self._ttfb.get(dom)
+        if ttfb is not None:
+            # A host that always thinks for 2 s (Crossref) is slow, not
+            # stalled: hedge only well past ITS normal time to headers.
+            wait = max(wait, 2.5 * ttfb)
+        t0 = time.monotonic()
+        first = asyncio.ensure_future(self._open_stream(url, headers, timeout))
+        done, _ = await asyncio.wait({first}, timeout=wait)
+        if done:
+            if first.exception() is None:
+                self._note_ttfb(dom, time.monotonic() - t0)
+            return first.result()
+        self._bump("stall_hedge")
+        second = asyncio.ensure_future(
+            self._open_stream(url, headers, timeout, client=await self._hedge_client()))
+        racers = {first, second}
+        error: BaseException | None = None
+        try:
+            while racers:
+                done, racers = await asyncio.wait(racers, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    if t.exception() is None:
+                        winner = t.result()
+                        if t is second:
+                            self._bump("stall_hedge_won")
+                        for other in racers:
+                            other.cancel()
+                            other.add_done_callback(_close_quietly)
+                        return winner
+                    error = error or t.exception()
+        except BaseException:
+            for t in (first, second):
+                t.cancel()
+                t.add_done_callback(_close_quietly)
+            raise
+        assert error is not None
+        raise error
+
+    async def _open_stream(self, url: str, headers: dict, timeout: float,
+                           client: httpx.AsyncClient | None = None) -> httpx.Response:
         """GET ``url`` following redirects hop by hop, policy-checking each.
 
         Auto-follow was replaced by this manual loop because no client
@@ -1513,7 +2556,16 @@ class Ladder:
         response; the caller consumes and closes it. Hop budget matches the
         old client-level follow (initial + ``max_redirects`` follows).
         """
-        c = await self._client()
+        c = client or await self._client()
+        if isinstance(timeout, (int, float)) and (
+                self.s.connect_timeout_s > 0 or self.s.read_stall_s > 0):
+            # A per-request float REPLACES the client's httpx.Timeout, so the
+            # connect/read-stall knobs were silently off on every tier-0 GET
+            # (found 2026-10-27: #59 and #72 measured a no-op). Rebuild them.
+            timeout = httpx.Timeout(
+                timeout,
+                connect=min(self.s.connect_timeout_s or timeout, timeout),
+                read=min(self.s.read_stall_s or timeout, timeout))
         current = url
         for _hop in range(self.s.max_redirects + 1):
             why = _refused_target(current)
@@ -1606,10 +2658,31 @@ class Ladder:
             headers = self._session_headers(session, headers, url)
         else:
             headers = self._clearance_headers(dom, headers, url)
+        cond = COND_HEADERS.get()
+        if cond:
+            headers = {**headers, **cond}
+        if ACCEPT_MD.get():
+            headers = {**headers, "Accept": _MD_ACCEPT}
         try:
-            r = await self._open_stream(url, headers, self.s.tier0_timeout_s)
+            r = await self._open_hedged(url, headers, self.s.tier0_timeout_s)
             try:
+                t_body = time.monotonic()
+                soft = BODY_SOFT_CAP.get()
+                n_cut = len(soft[1]) if soft is not None else 0
                 raw = await self._read_capped(r, self.s.max_body_bytes)
+                self._note_transfer(getattr(r, "num_bytes_downloaded", len(raw)),
+                                    time.monotonic() - t_body)
+                if (getattr(self.s, "pdf_reuse_bytes", False)
+                        and (soft is None or len(soft[1]) == n_cut)
+                        and len(raw) <= self.s.pdf_max_bytes
+                        and pdf_mod.looks_like_pdf(raw)):
+                    # pdf_reuse_bytes: the whole file is in hand -- the
+                    # extraction takes these bytes instead of downloading
+                    # the PDF a second time (_fetch_bytes).
+                    self._pdf_raw[str(r.url)] = raw
+                    self._pdf_raw[url] = raw
+                    while len(self._pdf_raw) > 4:
+                        self._pdf_raw.pop(next(iter(self._pdf_raw)))
                 # Match r.text's behavior on the cheap tiers: header charset
                 # wins, utf-8-lossy otherwise (a meta-only charset mojibakes
                 # here -- classify's guard refuses it and the climb reaches
@@ -1658,6 +2731,11 @@ class Ladder:
         The import is local so curl_cffi stays an optional dependency: without
         it the ladder simply skips this tier rather than failing to import.
         """
+        pre = getattr(self, "_preimport", None)
+        if pre is not None:
+            # Wait for the worker's import instead of running it here: on
+            # the loop, the first tier-1 fetch froze every other provider.
+            await asyncio.wrap_future(pre)
         try:
             from curl_cffi import requests as cffi_requests
         except ImportError as exc:
@@ -1726,15 +2804,20 @@ class Ladder:
                     # otherwise hands libcurl a CurlOpt.RESOLVE entry, making
                     # the dial reuse the SAME vetted answers (no TOCTOU).
                     hop_hdrs = _hop_headers(hdrs, doc_url, current)
-                    r = cffi_requests.get(
-                        current,
+                    # The fingerprint follows the UA on the wire (bug 141):
+                    # a clearance replay pins the browser's UA, and the
+                    # persona's own UA maps back to its own target.
+                    target = persona_mod.impersonate_for_ua(
+                        hop_hdrs.get("User-Agent", ""), p.impersonate)
+                    kw = dict(
                         headers=hop_hdrs,
-                        # The fingerprint follows the UA on the wire (bug 141):
-                        # a clearance replay pins the browser's UA, and the
-                        # persona's own UA maps back to its own target.
-                        impersonate=persona_mod.impersonate_for_ua(
-                            hop_hdrs.get("User-Agent", ""), p.impersonate),
-                        timeout=self.s.tier1_timeout_s,
+                        impersonate=target,
+                        # tier1_connect_timeout_s: (connect, read) -- a lost
+                        # SYN fails over in seconds, not the whole tier budget.
+                        timeout=((min(self.s.tier1_connect_timeout_s, self.s.tier1_timeout_s),
+                                  self.s.tier1_timeout_s)
+                                 if self.s.tier1_connect_timeout_s > 0
+                                 else self.s.tier1_timeout_s),
                         allow_redirects=False,
                         cookies=hop_cookies or None,
                         curl_options=_resolve_pin(
@@ -1742,8 +2825,11 @@ class Ladder:
                             cur_parts.port
                             or (443 if cur_parts.scheme == "https" else 80)),
                         proxies={"http": self.s.proxy, "https": self.s.proxy} if self.s.proxy else None,
-                        stream=True,
                     )
+                    if self.s.tier1_pool:
+                        r = self._pooled_get(current, target, cap, **kw)
+                    else:
+                        r = cffi_requests.get(current, stream=True, **kw)
                     if r.status_code in _REDIRECT_STATUSES and r.headers.get("location"):
                         try:
                             for sc_hdr in r.headers.get_list("set-cookie"):
@@ -1794,7 +2880,9 @@ class Ladder:
                             f"too_large: content-length {cl} exceeds cap {cap}")
                     chunks: list[bytes] = []
                     total = 0
-                    for chunk in r.iter_content():
+                    pooled_body = getattr(r, "_searchio_body", None)
+                    for chunk in ([pooled_body] if pooled_body is not None
+                                  else r.iter_content()):
                         total += len(chunk)
                         if total > cap:
                             raise TransientError(
@@ -1852,6 +2940,55 @@ class Ladder:
             if isinstance(exc, OSError):
                 raise TransientError(f"tier1 {name}: {exc}") from exc
             raise SearchioError(f"tier1 {name}: {exc}") from exc
+
+    def _pooled_get(self, url: str, target: str, cap: int, **kw):
+        """One tier-1 GET on a kept-alive curl_cffi Session (tier1_pool).
+
+        Runs on a tier-1 worker thread. Each (thread, impersonation target)
+        owns one Session, so a connection is only ever reused under the TLS
+        fingerprint that opened it and no handle is shared across threads.
+        Nothing identity-bearing survives a request: response cookies are
+        discarded (the hop jar above is the only cookie store) and curl_cffi
+        flushes the handle's cookie engine before every request. The body is
+        collected by a write callback that aborts the transfer past ``cap``
+        -- the same decoded-bytes cap the streaming path enforces -- because
+        a streamed request duplicates the handle and so never reuses a
+        connection.
+        """
+        from curl_cffi import requests as cffi_requests
+        from curl_cffi.curl import CURL_WRITEFUNC_ERROR
+
+        by_target = getattr(self._cffi_local, "by_target", None)
+        if by_target is None:
+            by_target = self._cffi_local.by_target = {}
+        sess = by_target.get(target)
+        if sess is None:
+            sess = by_target[target] = cffi_requests.Session()
+            self._cffi_sessions.append(sess)
+        chunks: list[bytes] = []
+        state = {"total": 0, "over": False}
+
+        def sink(data: bytes):
+            state["total"] += len(data)
+            if state["total"] > cap:
+                state["over"] = True
+                return CURL_WRITEFUNC_ERROR
+            chunks.append(data)
+            return len(data)
+
+        # Session.request() takes no per-request curl_options (curl_cffi
+        # 0.17); the session's own dict is merged into every request instead,
+        # and this session belongs to this thread alone, so setting it per
+        # request pins exactly this request's vetted DNS answers.
+        sess.curl_options = kw.pop("curl_options", None) or {}
+        try:
+            r = sess.get(url, content_callback=sink, discard_cookies=True, **kw)
+        except Exception:
+            if state["over"]:
+                raise TransientError(f"too_large: decoded body exceeds cap {cap}") from None
+            raise
+        r._searchio_body = b"".join(chunks)
+        return r
 
     async def _tier2(self, url: str, *, rendered: bool = False,
                      session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
@@ -1937,9 +3074,29 @@ class Ladder:
     async def _tier2_on_tab(
         self, client: SidecarClient, url: str, tab_id: str
     ) -> tuple[int, dict, str, str, str]:
+        origin_first = getattr(self.s, "tier2_origin_first", False)
+        if origin_first:
+            # tier2_origin_first: arrive the way a visitor does -- homepage,
+            # then the deep link -- BEFORE first contact. On some walls the
+            # first cold deep hit flags the session and a warm-up after that
+            # denial is too late (#176).
+            origin = self._origin_of(url)
+            if origin and origin != url:
+                try:
+                    await client.goto(origin, tab_id=tab_id)
+                    self._bump("tier2_origin_first")
+                    await asyncio.sleep(getattr(self.s, "tier2_origin_dwell_s", 1.5))
+                except Exception:
+                    pass  # a failed warm-up is not worse than no warm-up
+        # tier2_wait_until: how far a real browser's navigation must get
+        # before the page is read (the patchright verb's own default is the
+        # full load event; its hydration wait covers late client data).
+        # The engine backend has no such knob and is never sent one.
+        wait = getattr(self.s, "tier2_wait_until", "")
+        kw = {"wait_until": wait} if wait and getattr(client, "binary", None) is None else {}
         res = await client.fetch(
             url, tab_id=tab_id, timeout=self.s.tier2_timeout_s,
-            timeout_ms=int(self.s.tier2_timeout_s * 1000 / 3),
+            timeout_ms=int(self.s.tier2_timeout_s * 1000 / 3), **kw,
         )
 
         nav_err = _nav_error_landing(res)
@@ -1953,7 +3110,8 @@ class Ladder:
             # second navigation reaching the identical dead end either.
             raise NavErrorPage(f"tier2: {nav_err}")
 
-        if self._sidecar_refused(res):
+        if self._sidecar_refused(res) or (
+                getattr(self.s, "tier2_warmup_on_wall", False) and self._wall_page(res)):
             origin = self._origin_of(url)
             if origin and origin != url:
                 try:
@@ -2060,6 +3218,21 @@ class Ladder:
             return True
         status = int(res.get("status") or 200)
         return status in (401, 403, 429) or status >= 500
+
+    @staticmethod
+    def _wall_page(res: dict) -> bool:
+        """tier2_warmup_on_wall: an ``ok`` reply whose page is a bot wall
+        ("Access Denied" served 200 to a real browser). The sidecar does not
+        flag it, so the origin warm-up -- the cure for exactly a cold first
+        contact -- never ran; the classifier the ladder applies afterwards
+        is asked here instead."""
+        if not res.get("ok"):
+            return False
+        body = str(res.get("html") or res.get("text") or "")
+        if not body:
+            return False
+        headers = res.get("headers") if isinstance(res.get("headers"), dict) else {}
+        return classify(int(res.get("status") or 200), headers, body).blocked
 
     @staticmethod
     def _origin_of(url: str) -> str:

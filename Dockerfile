@@ -55,16 +55,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # SEARCHIO_SIDECAR_* env at run time if wanted.
     SEARCHIO_SIDECAR_ENGINE=1 \
     SEARCHIO_SIDECAR_AUTOSTART=1 \
-    SEARCHIO_ENGINE_BIN=/usr/local/bin/se-serve
+    SEARCHIO_ENGINE_BIN=/usr/local/bin/se-serve \
+    # The challenge sidecar's browser: headed (on Xvfb, see CMD), no
+    # user-namespace sandbox in a container.
+    SWARM_BROWSER_HEADLESS=0 \
+    SWARM_BROWSER_NO_SANDBOX=1
 
 # The challenge tier's Chromium system libraries are installed by patchright
 # itself (--with-deps installs the distro set; bookworm is supported), so the
 # list stays correct as Chromium's needs change. Fonts are for readable
 # screenshots. The sidecar adds --no-sandbox/--disable-dev-shm-usage itself
 # when it detects a container.
+# Xvfb: the challenge tier runs Chromium HEADED on a virtual display.
+# Cloudflare, DataDome and Akamai fingerprint headless Chromium; in a
+# container A/B (bench/browserprobe.py, 6 walled pages x 2 passes) headed
+# loaded 10/12 and headless 2/12 (both of those via tier 1, not the browser).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates fonts-liberation fonts-noto-color-emoji \
+      ca-certificates fonts-liberation fonts-noto-color-emoji xvfb xauth tini \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=engine /engine/target/release/se-serve /usr/local/bin/se-serve
@@ -79,5 +87,9 @@ RUN pip install --no-cache-dir '.[mcp]' patchright \
 # keep them across container restarts.
 VOLUME /root/.searchio
 
-# stdio MCP by default (pair with `docker run -i`).
-CMD ["searchio-mcp"]
+# stdio MCP by default (pair with `docker run -i`), on a virtual display so
+# the challenge tier's Chromium can run headed. xvfb-run as PID 1 never sees
+# Xvfb's ready signal and hangs (3/3 runs; 3/3 fine under an init), so tini
+# is PID 1.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "searchio-mcp"]

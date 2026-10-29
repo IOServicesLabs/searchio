@@ -39,6 +39,27 @@ import httpx
 
 from ..errors import SidecarUnavailable, SidecarVerbError
 
+#: sidecar_fast_probe: a closed LOCAL port is asked with a 0.25 s connect
+#: first. Windows answers a refused loopback connect only after its SYN
+#: retries (~1 s, measured), and the first tier-2 climb of every process
+#: paid that before learning nothing listens; a live sidecar accepts in <1 ms.
+_FAST_PROBE = [False]
+
+
+async def _port_open(base: str) -> bool:
+    from urllib.parse import urlsplit
+
+    p = urlsplit(base)
+    if p.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return True  # remote: the HTTP probe decides
+    try:
+        _r, w = await asyncio.wait_for(
+            asyncio.open_connection(p.hostname, p.port or 80), 0.25)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    w.close()
+    return True
+
 # Verbs searchio uses. The sidecar exposes ~60; these are the ones that earn
 # their place in a search engine.
 VERB_FETCH = "fetch"  # HTTP-first, escalates to browser only if needed
@@ -95,15 +116,17 @@ def default_engine_path() -> Path | None:
     installed = Path.home() / ".searchio" / "bin" / name
     if installed.is_file():
         return installed
-    rel = Path("target") / "debug" / name
     for base in (
         Path.cwd().parent / "searchio-engine",
         Path.home() / "Documents" / "searchio-engine",
         Path.home() / "src" / "searchio-engine",
     ):
-        cand = base / rel
-        if cand.is_file():
-            return cand
+        # A release build first: `cargo build --release` (the README's
+        # build-from-source line) was never found, only a debug build.
+        for profile in ("release", "debug"):
+            cand = base / "target" / profile / name
+            if cand.is_file():
+                return cand
     return None
 
 
@@ -534,6 +557,8 @@ class SidecarClient:
         raise SidecarUnavailable(self._unavailable_reason)
 
     async def _healthy(self, base: str) -> bool:
+        if _FAST_PROBE[0] and not await _port_open(base):
+            return False
         try:
             async with httpx.AsyncClient(timeout=5.0) as c:
                 r = await c.get(f"{base}/healthz")
@@ -737,7 +762,7 @@ class SidecarClient:
     # ── typed verbs ──────────────────────────────────────────────────────────
 
     async def fetch(self, url: str, *, tab_id: str = "default", timeout: float | None = None,
-                    timeout_ms: int | None = None) -> dict:
+                    timeout_ms: int | None = None, wait_until: str = "") -> dict:
         """HTTP-first page fetch that escalates to the browser only if needed.
 
         ``timeout`` bounds the RPC call itself; ``timeout_ms`` is forwarded to
@@ -750,6 +775,8 @@ class SidecarClient:
         params: dict[str, Any] = {"url": url, "tab_id": tab_id}
         if timeout_ms is not None:
             params["timeout_ms"] = timeout_ms
+        if wait_until:
+            params["wait_until"] = wait_until
         return await self.call(VERB_FETCH, params, timeout=timeout)
 
     async def search(self, query: str, *, engine: str = "auto", k: int = 10,

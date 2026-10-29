@@ -37,10 +37,50 @@ class Health:
     ema_success: float = 1.0
     opened_at: float = 0.0  # circuit-breaker trip time, 0 when closed
     last_error: str = ""
+    #: breaker_backoff_s: the first cooldown; 0 = always COOLDOWN_S. Set by
+    #: the router from Settings.
+    backoff_base_s: float = 0.0
+    #: Trips since the last success: each re-trip doubles the cooldown.
+    trips: int = 0
+    #: starved_probe_s: when the router last let this breaker's provider
+    #: through as a starvation probe.
+    last_probe: float = 0.0
+    #: ratelimit_aware / degraded_hold_s: this trip's exact cooldown, when
+    #: the failure itself said how long (0 = the normal rule).
+    hold_s: float = 0.0
+    #: halfopen_single: a half-open probe call is in flight.
+    probing: bool = False
 
     ALPHA = 0.3
     TRIP_AFTER = 3  # consecutive failures before opening
     COOLDOWN_S = 120.0
+
+    @property
+    def cooldown_s(self) -> float:
+        """This trip's cooldown: COOLDOWN_S, or the backed-off one."""
+        if self.hold_s > 0:
+            return self.hold_s
+        if self.backoff_base_s <= 0:
+            return self.COOLDOWN_S
+        return min(self.COOLDOWN_S, self.backoff_base_s * 2 ** max(self.trips - 1, 0))
+
+    def trip(self) -> None:
+        """Open the breaker now (the third strike, or a fast trip)."""
+        self.opened_at = time.monotonic()
+        self.trips += 1
+        self.hold_s = 0.0
+
+    def hold(self, seconds: float) -> None:
+        """Open the breaker for exactly ``seconds`` (a stated reset time)."""
+        self.opened_at = time.monotonic()
+        self.hold_s = max(float(seconds), 1.0)
+        # Half-open after the hold: one more failure re-opens at once.
+        self.consecutive_failures = max(self.consecutive_failures, self.TRIP_AFTER)
+
+    @property
+    def half_open(self) -> bool:
+        """Cooldown over, breaker not yet closed: the next call is a probe."""
+        return bool(self.opened_at) and not self.open
 
     def record(self, ok: bool, latency_ms: float, error: str = "") -> None:
         self.calls += 1
@@ -48,6 +88,8 @@ class Health:
         self.ema_success = (1 - self.ALPHA) * self.ema_success + self.ALPHA * (1.0 if ok else 0.0)
         if ok:
             self.consecutive_failures = 0
+            self.trips = 0
+            self.hold_s = 0.0
             if self.opened_at:
                 self.opened_at = 0.0  # half-open probe succeeded; close it
         else:
@@ -55,14 +97,14 @@ class Health:
             self.consecutive_failures += 1
             self.last_error = error[:200]
             if self.consecutive_failures >= self.TRIP_AFTER:
-                self.opened_at = time.monotonic()
+                self.trip()
 
     @property
     def open(self) -> bool:
         """True while the breaker is holding calls back."""
         if not self.opened_at:
             return False
-        if time.monotonic() - self.opened_at > self.COOLDOWN_S:
+        if time.monotonic() - self.opened_at > self.cooldown_s:
             # Cooldown elapsed: allow one probe through (half-open).
             return False
         return True

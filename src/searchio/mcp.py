@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 from typing import Any
@@ -70,6 +71,21 @@ async def _engine() -> Engine:
     if _ENGINE is None:
         _ENGINE = Engine(get_settings())
     return _ENGINE
+
+
+@contextlib.asynccontextmanager
+async def _warm_lifespan(_server):
+    """Warm the engine in the background while the client handshakes
+    (``warmup_on_start``): the first tool call then skips the cold-start
+    imports, robots round trips and TLS handshakes."""
+    task = None
+    if get_settings().warmup_on_start:
+        task = asyncio.ensure_future((await _engine()).warmup())
+    try:
+        yield {}
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
 
 
 async def shutdown() -> None:
@@ -172,7 +188,7 @@ def build_server() -> "FastMCP":
             "Install it with: pip install 'mcp>=1.8,<2'"
         )
 
-    mcp = FastMCP("searchio")
+    mcp = FastMCP("searchio", lifespan=_warm_lifespan)
 
     @mcp.tool()
     async def search(
@@ -207,6 +223,63 @@ def build_server() -> "FastMCP":
             "providers_failed": res.failed,
             "results": [_to_jsonable(d) for d in res.docs],
         }
+
+    @mcp.tool()
+    async def search_many(
+        queries: list[str],
+        intent: str = "web",
+        k: int = 10,
+        freshness: str = "all",
+        locale: str = "",
+    ) -> dict:
+        """Run several searches in one call, concurrently -- much faster than
+        calling `search` once per query.
+
+        Args:
+            queries: The searches to run (at most 10).
+            intent: web | news | academic | code ... (applies to all).
+            k: Results per query (1-50).
+            freshness: all | day | week | month | year.
+            locale: Language/market of the questions, e.g. de-DE.
+        """
+        eng = await _engine()
+        texts = [q.strip() for q in queries if q and q.strip()][:10]
+        results = await _guarded("search", eng.search_many(
+            texts, intent=intent.strip().lower(), k=k,
+            freshness=freshness.strip().lower(), locale=locale.strip(),
+        ))
+        out = []
+        for text, res in zip(texts, results):
+            if isinstance(res, Exception):
+                out.append({"query": text, "error": f"{type(res).__name__}: {res}"[:300]})
+                continue
+            out.append({
+                "query": text,
+                "elapsed_ms": res.elapsed_ms,
+                "providers_used": res.used,
+                "providers_failed": res.failed,
+                "results": [_to_jsonable(d) for d in res.docs],
+            })
+        return {"intent": intent, "searches": out}
+
+    @mcp.tool()
+    async def read_many(urls: list[str]) -> dict:
+        """Read several pages in one call, concurrently -- much faster than
+        calling `read_url` once per page.
+
+        Args:
+            urls: The pages to read (at most 10).
+        """
+        eng = await _engine()
+        targets = [u.strip() for u in urls if u and u.strip()][:10]
+        docs = await _guarded("read_url", eng.read_many(targets))
+        out = []
+        for url, d in zip(targets, docs):
+            if isinstance(d, Exception):
+                out.append({"url": url, "error": f"{type(d).__name__}: {d}"[:300]})
+            else:
+                out.append(_to_jsonable(d))
+        return {"pages": out}
 
     @mcp.tool()
     async def search_items(query: str, k: int = 10, domains: str = "") -> dict:

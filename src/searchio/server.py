@@ -34,9 +34,14 @@ _engine: Engine | None = None
 async def lifespan(app: FastAPI):
     global _engine
     _engine = Engine(get_settings())
+    # Background, not awaited: the server is up at once and the first
+    # request finds the ladder warm (or warming).
+    warm = asyncio.ensure_future(_engine.warmup()) if _engine.s.warmup_on_start else None
     try:
         yield
     finally:
+        if warm is not None and not warm.done():
+            warm.cancel()
         await _engine.close()
         _engine = None
 
@@ -223,6 +228,8 @@ async def read(url: str = QueryParam(..., max_length=4096,
                                                      "reads with this id never ride on another's."),
                request: Request = None) -> dict:
     eng = engine()
+    if getattr(getattr(eng, "s", None), "read_via_engine", False) and not session:
+        return await _read_doc(eng, url, request)
     task = asyncio.ensure_future(eng.ladder.fetch(url, session=session))
     watcher = asyncio.ensure_future(_until_disconnect(request, task)) if request is not None else None
     try:
@@ -251,6 +258,41 @@ async def read(url: str = QueryParam(..., max_length=4096,
         "escalations": res.escalations,
         "title": title_of(res.body),
         "text": to_markdown(res.body, url),
+    }
+
+
+#: read_via_engine: the tier a Doc's ``fetched_via`` names (lean/markdown
+#: variants keep their base tier: "http+md" is tier 0).
+_VIA_TIER = {"http": 0, "impersonate": 1, "browser": 2}
+
+
+async def _read_doc(eng, url: str, request: Request | None) -> dict:
+    """/read through Engine.read (the MCP tool's path): lean reads,
+    markdown negotiation, the redirect memo, the PDF budget. Same keys."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    task = asyncio.ensure_future(eng.read(url))
+    watcher = asyncio.ensure_future(_until_disconnect(request, task)) if request is not None else None
+    try:
+        doc = await task
+    except asyncio.CancelledError:
+        raise HTTPException(status_code=499, detail="client disconnected") from None
+    except SearchioError as exc:
+        raise _http_error(exc) from exc
+    finally:
+        if watcher is not None:
+            watcher.cancel()
+    via = doc.fetched_via or ""
+    return {
+        "url": doc.url or url,
+        "status": 200,
+        "tier": _VIA_TIER.get(via.split("+", 1)[0].split(":", 1)[0], 0),
+        "via": via,
+        "elapsed_ms": int((_time.monotonic() - t0) * 1000),
+        "escalations": [],
+        "title": doc.title,
+        "text": doc.text,
     }
 
 

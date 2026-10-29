@@ -20,11 +20,27 @@ worth having even when the disallow rules are advisory here.
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 
+from ._sqlite import connect_locked
+
+log = logging.getLogger(__name__)
+
 UA = "searchio"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS robots (
+    origin   TEXT PRIMARY KEY,
+    status   INTEGER NOT NULL,
+    body     TEXT NOT NULL,
+    fetched  REAL NOT NULL
+);
+"""
 
 #: Rules per group are capped so a 500 KiB hostile robots.txt cannot turn
 #: every check into a scan of hundreds of thousands of regexes.
@@ -225,11 +241,32 @@ class RobotsCache:
     convention asks for that.
     """
 
-    def __init__(self, fetcher, policy: str = "warn", ttl_s: int = 86400) -> None:
+    def __init__(self, fetcher, policy: str = "warn", ttl_s: int = 86400, *,
+                 store_path: Path | None = None, nonblocking: bool = False) -> None:
         self._fetch = fetcher  # async (url) -> (status, text)
         self.policy = policy
         self.ttl_s = ttl_s
         self._cache: dict[str, _Entry] = {}
+        #: Persisted answers (robots_persist): a fresh process reads the
+        #: origin's robots.txt from disk instead of paying a serial round
+        #: trip before its first request to every host. Only DECIDED answers
+        #: are stored (a 200 or a 404); an unreadable robots.txt stays a
+        #: per-process miss so a flaky origin is re-asked next run.
+        self._db = None
+        if store_path is not None:
+            try:
+                store_path.parent.mkdir(parents=True, exist_ok=True)
+                db = connect_locked(str(store_path))
+                db.executescript(_SCHEMA)
+                db.execute("PRAGMA journal_mode=WAL")
+                db.commit()
+                self._db = db
+            except (sqlite3.Error, OSError) as exc:
+                log.warning("robots store %s: %s (memory-only)", store_path, exc)
+        #: robots_nonblocking: under warn/off a miss never gates the request.
+        #: (enforce must wait -- it may refuse.)
+        self.nonblocking = nonblocking
+        self._bg: set[asyncio.Task] = set()
         #: Single-flight for the robots.txt load (bug 170): a wave of
         #: concurrent same-host fetches all missed the cache and each
         #: fetched /robots.txt -- the politeness layer hammering the
@@ -244,8 +281,21 @@ class RobotsCache:
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
         entry = self._cache.get(origin)
+        if entry is None and self._db is not None:
+            entry = self._from_store(origin)
         if entry is None or time.time() - entry.fetched > self.ttl_s:
-            entry = await self._load_once(origin)
+            if self.nonblocking and self.policy != "enforce":
+                # Warn never refuses, so the answer only annotates: load it
+                # alongside the request instead of in front of it. The next
+                # fetch to this origin sees the rules (and any crawl-delay).
+                if origin not in self._inflight:
+                    t = asyncio.ensure_future(self._load_once(origin))
+                    self._bg.add(t)
+                    t.add_done_callback(self._bg_done)
+                if entry is None:
+                    return RobotsInfo(allowed=True, checked=False, reason="robots_pending")
+            else:
+                entry = await self._load_once(origin)
 
         if not entry.present:
             return RobotsInfo(allowed=True, checked=False, reason="robots_unavailable")
@@ -291,17 +341,66 @@ class RobotsCache:
             return entry
         except BaseException as exc:  # noqa: BLE001 -- propagate to every waiter
             if not fut.done():
-                fut.set_exception(exc)
+                if isinstance(exc, asyncio.CancelledError):
+                    # A shutdown cancel: waiters see a cancel, and nothing
+                    # logs "Future exception was never retrieved".
+                    fut.cancel()
+                else:
+                    fut.set_exception(exc)
+                    fut.exception()  # retrieved even when nobody was waiting
             raise
         finally:
             self._inflight.pop(origin, None)
+
+    def _bg_done(self, t: asyncio.Task) -> None:
+        self._bg.discard(t)
+        if not t.cancelled():
+            t.exception()  # a background load's failure is a miss, never "unretrieved"
 
     async def _load(self, origin: str) -> _Entry:
         try:
             status, text = await self._fetch(f"{origin}/robots.txt")
         except Exception:
             return _Entry(group=None, failed=True)
-        if status != 200 or not text:
-            # 404 means no restrictions; anything else we could not read.
-            return _Entry(group=None, failed=status != 404)
-        return _Entry(group=_group_for(parse_robots(text), UA), present=True)
+        entry = _entry_from(status, text)
+        if self._db is not None and not entry.failed:
+            try:
+                self._db.execute(
+                    "INSERT OR REPLACE INTO robots (origin, status, body, fetched) "
+                    "VALUES (?,?,?,?)", (origin, status, text if status == 200 else "",
+                                         entry.fetched))
+                self._db.commit()
+            except sqlite3.Error:
+                pass
+        return entry
+
+    def _from_store(self, origin: str) -> _Entry | None:
+        try:
+            row = self._db.execute(
+                "SELECT status, body, fetched FROM robots WHERE origin = ?", (origin,)
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        try:
+            entry = _entry_from(int(row[0]), str(row[1] or ""))
+            entry.fetched = float(row[2])
+        except (TypeError, ValueError):
+            return None
+        self._cache[origin] = entry
+        return entry
+
+    def close(self) -> None:
+        for t in list(self._bg):
+            t.cancel()
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+
+
+def _entry_from(status: int, text: str) -> _Entry:
+    if status != 200 or not text:
+        # 404 means no restrictions; anything else we could not read.
+        return _Entry(group=None, failed=status != 404)
+    return _Entry(group=_group_for(parse_robots(text), UA), present=True)

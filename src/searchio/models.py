@@ -132,6 +132,10 @@ class FetchResult(BaseModel):
     elapsed_ms: int = 0
     escalations: list[str] = Field(default_factory=list)  # why each tier was abandoned
     from_cache: bool = False
+    #: Validators the origin sent (revalidate_cache): an expired entry is
+    #: re-asked conditionally and a 304 refreshes it without the body.
+    etag: str = ""
+    last_modified: str = ""
     #: True when the body was served by the challenge/fidelity sidecar
     #: (ladder ``rendered=True``, or the one-shot engine-shell auto-rescue).
     rendered: bool = False

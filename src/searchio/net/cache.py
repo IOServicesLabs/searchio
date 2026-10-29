@@ -80,7 +80,9 @@ class Cache:
         if self.errors == 1:
             log.warning("cache %s: %s (%s)", self.path, self.last_error, what)
 
-    def get(self, url: str, variant: str = "") -> Any | None:
+    def get(self, url: str, variant: str = "", stale_for: float = 0.0) -> Any | None:
+        """The cached value, or None. ``stale_for`` > 0 also accepts an entry
+        up to that many seconds past its TTL (stale-while-revalidate)."""
         if not self._db:
             return None
         try:
@@ -93,7 +95,7 @@ class Cache:
         if not row:
             return None
         payload, created = row
-        if time.time() - created > self.ttl_s:
+        if time.time() - created > self.ttl_s + max(stale_for, 0.0):
             return None
         try:
             return json.loads(payload)

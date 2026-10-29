@@ -43,6 +43,24 @@ class TargetRefused(TransientError):
     """
 
 
+class Throttled(TransientError):
+    """Our own limiter would hold this request longer than the caller can
+    wait. Nothing was sent: the host's backed-off rate (after blocks) is
+    honored by not asking, instead of by sleeping through a search's whole
+    budget and timing out with nothing."""
+
+
+class RateLimited(TransientError):
+    """The host's own rate limit answered (ratelimit_aware): a 429, or an API
+    403 whose x-ratelimit-remaining is 0. Not a wall -- no other tier or
+    fingerprint changes a per-IP quota -- so the fetch ends here, and
+    ``retry_after`` (seconds) says when asking again can succeed."""
+
+    def __init__(self, message: str, retry_after: float = 60.0) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class NavErrorPage(TransientError):
     """The tab committed the browser's network-error page.
 
@@ -89,8 +107,12 @@ class Unusable(SearchioError):
 class ProviderError(SearchioError):
     """A provider adapter failed in a way retrying will not fix."""
 
-    def __init__(self, provider: str, message: str):
+    def __init__(self, provider: str, message: str, *, walled: bool = False):
         self.provider = provider
+        #: Every attempt hit an anti-bot wall (as opposed to a flake or an
+        #: empty answer): the egress is refused, and asking again within the
+        #: breaker cooldown only spends seconds and a fresh block signal.
+        self.walled = walled
         super().__init__(f"provider {provider}: {message}")
 
 

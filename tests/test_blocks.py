@@ -258,3 +258,32 @@ class TestVisibleTextBounded:
         assert visible_text("a<script>x</script>b<style>y</style>c") == "a b c"
         # adjacent blocks stop at the first close, not the last
         assert visible_text("<script>a</script>MID<script>b</script>END") == "MID END"
+
+
+class TestEdgeReferencePages:
+    """A CDN edge's refusal ID on a nearly empty 200 page is a vendor block
+    (live: a listings site served "page unavailable ... Incident Number:
+    18.2a34d517.1793229018.7253767" at tier 0, read as content)."""
+
+    UNAVAILABLE = ("<html><head><title>Example - page unavailable</title></head><body>"
+                   "<p>We're sorry for any inconvenience, but the site is currently unavailable.</p>"
+                   "<p>Incident Number: 18.2a34d517.1793229018.7253767</p></body></html>")
+    DENIED = ("<html><head><title>Oops</title></head><body><h1>Not allowed</h1>"
+              "<p>Reference #18.1334d517.1793229027.69e9307</p></body></html>")
+
+    def test_incident_number_page_is_blocked(self):
+        v = classify(200, {"content-type": "text/html"}, self.UNAVAILABLE)
+        assert v.blocked and v.reason == "edge_ref" and v.vendor == "akamai"
+
+    def test_reference_hash_page_is_blocked(self):
+        v = classify(200, {"content-type": "text/html"}, self.DENIED)
+        assert v.blocked and v.reason == "edge_ref"
+
+    def test_a_real_page_quoting_a_reference_is_not(self):
+        body = ("<html><body><article>" + ("Real article text about CDN errors. " * 60)
+                + "Reference #18.2a34d517.1793229018.7253767</article></body></html>")
+        assert not classify(200, {"content-type": "text/html"}, body).blocked
+
+    def test_an_ordinary_reference_number_is_not(self):
+        body = "<html><body><p>Order confirmed. Reference #12345. Thanks!</p></body></html>"
+        assert classify(200, {"content-type": "text/html"}, body).reason != "edge_ref"

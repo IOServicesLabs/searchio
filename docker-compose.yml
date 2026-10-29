@@ -12,7 +12,14 @@ services:
     tty: false
     volumes:
       - searchio-state:/root/.searchio
+      # The challenge tier (a real, headed Chromium) needs SwarmIO's browser
+      # sidecar script, which is not baked into the image. Mount its directory
+      # and SEARCHIO_SIDECAR_SCRIPT below picks it up:
+      # - ~/.searchio/swarm-sidecar:/opt/swarm-sidecar:ro
     environment:
+      # SEARCHIO_SIDECAR_SCRIPT: /opt/swarm-sidecar/browser_sidecar.py
+      # A persistent identity profile in the state volume, seedable once:
+      # SWARM_BROWSER_IDENTITY_DIR: /root/.searchio/identity-profile
       # Optional keys — the ladder degrades gracefully without them, and
       # engine-tier fetches need none.
       # SearXNG-style direct engines + the engine sidecar work keyless.

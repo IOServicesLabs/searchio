@@ -457,7 +457,11 @@ class TestPerTierContentOracle:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
-            s = make_settings()
+            # The oracle serves the shell to the FIRST request, not by client:
+            # it tests tier attribution, so the climb must reach tier 1 --
+            # thin_skip_tier1 (a JS shell skips tier 1; 0 of 35 real shells
+            # read better there) is pinned off for that.
+            s = make_settings(thin_skip_tier1=False)
             lad = Ladder(s, sidecar=_UnusableSidecar())
             try:
                 r = await lad.fetch(f"{base}/page", use_cache=False)
@@ -479,7 +483,7 @@ class TestPerTierContentOracle:
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{srv.server_address[1]}"
         try:
-            s = make_settings()
+            s = make_settings(thin_skip_tier1=False)  # see the test above
             lad = Ladder(s, sidecar=_UnusableSidecar())
             try:
                 r = await lad.fetch(f"{base}/page", use_cache=False, rendered=True)
