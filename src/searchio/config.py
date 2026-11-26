@@ -247,7 +247,12 @@ class Settings(BaseSettings):
     # Idle keep-alive for the tier-0 connection pool. httpx's default is 5 s,
     # shorter than the gap between an agent's searches, so every search
     # paid a fresh TLS handshake per provider host.
-    http_keepalive_s: float = 5.0
+    #: #215 A/B at 5 / 30 / 60 with 5-15 s of think time between two reads on a
+    #: host (bench/keepalive.py). WIN at 30: live second read 214.5 -> 83.3 ms
+    #: (-116.7 [-184.4, -88.3], n=15, five hosts); fixture -9.0 [-10.2, -5.9].
+    #: 60 measured the same as 30 (-109.4 [-166.5, -79.3]), so the shorter one
+    #: ships: fewer idle sockets for the same gain at agent think times.
+    http_keepalive_s: float = 30.0
     # Long-lived servers (MCP, HTTP) warm the ladder at startup: imports,
     # the TLS client, robots.txt and a live connection per provider host.
     warmup_on_start: bool = True
@@ -584,6 +589,34 @@ class Settings(BaseSettings):
     #: A listing read states the search's total from the page's own data (or
     #: that it matched nothing), when the page's count fields agree.
     listing_result_count: bool = True  # b101 WIN (#188)
+    #: #230 A YouTube results / channel / playlist read lists the videos the
+    #: page holds in ytInitialData (title, channel, views, age, length, URL);
+    #: the visible markup of those pages is a footer.
+    #: WIN (yield): live channel tab 179 -> 4,916 chars (30 videos), results
+    #: page 164 -> 8,059 chars (20 videos + 20 Shorts); +48 / +244 ms CPU on a
+    #: 1.4 / 3.6 MB body, other hosts untouched.
+    extract_youtube_lists: bool = True
+    #: #231 An X / Twitter read lists the posts the page streamed (author,
+    #: time, text, counts, link) and the account's profile line, and drops the
+    #: inline script text the prose extractor leaked.
+    #: WIN (yield): live profile 445 -> 3,102 chars (account line + the 5
+    #: posts X serves signed-out, with counts and links), status page 500 ->
+    #: 812 (post + 3 replies), script text gone; +3 ms. A search page is
+    #: still a login form: that needs a session, not an extractor.
+    extract_x_posts: bool = True
+    #: #232 A listing row carries the record's packages / option groups
+    #: ("pkgs: FX4 Package; Utility Package"), and the listing block states
+    #: the keyword the page URL filtered by. Records inside a streamed,
+    #: escaped app payload (autotrader, kbb, carvana) are read too.
+    #: WIN (yield): live rows naming FX4 autotrader 4 -> 33, kbb 0 -> 4,
+    #: carvana 0 -> 4, carmax 0 -> 7 of 48; rows with a distance autotrader
+    #: 0 -> 34, kbb 0 -> 25; no row lost. Cost: +210..+380 ms CPU on the
+    #: three streamed-payload pages (1.3-2.4 MB), under +40 ms elsewhere.
+    listing_packages: bool = True
+    #: #233 find_items answers a vehicle query (a make with a model year or
+    #: for-sale wording, no part word) from the vehicle marketplaces' results
+    #: pages, one VIN-keyed item per car, instead of the retail product sites.
+    items_vehicle_listings: bool = True  # on 2026-11-25 by owner decision (quality over the ~35 s misclassification cost); measured on one live query
     #: Run tier 2's origin warm-up + one retry when the browser's page is a
     #: bot wall the sidecar did not flag (a 200 "Access Denied"), not only
     #: when the sidecar reports a refusal.
@@ -681,6 +714,231 @@ class Settings(BaseSettings):
     # If-Modified-Since): a 304 refreshes it without re-downloading the body.
     revalidate_cache: bool = False
     revalidate_max_age_s: float = 7 * 86400
+
+    # ── Browser-system batch (#189+). Each is OFF until bench/ab.py gives it
+    # a verdict; the verdict then goes beside the field, as above. ──────────
+    #: #189 A tier-2 success returns the page as soon as the jar is read once;
+    #: the 6 s settle re-read runs in the background, and is skipped when the
+    #: pass ran no page scripts (an unrendered engine pass sets no late cookie).
+    #: WIN: engine tier-2 read 6014 -> 5 ms (-6009 [-6018, -6006]); a tier-2 PDF 6031 -> 16 ms.
+    clearance_capture_bg: bool = True
+    #: #190 A host whose profile opens at the browser starts at tier 1 instead
+    #: while a fresh challenge cookie is banked for it.
+    #: UNMEASURED: unit-pinned only; needs the live walled-host leg. Off.
+    clearance_start_tier: bool = False
+    #: #190b Tier 0 (httpx TLS under a Chrome UA) never replays a challenge
+    #: cookie, so its 403 cannot discredit a clearance tier 1 would have used.
+    #: UNMEASURED: unit-pinned only; needs the live walled-host leg. Off.
+    clearance_skip_tier0: bool = False
+    #: #191 A banked row lives until its challenge cookie's own expiry (capped
+    #: by clearance_max_ttl_s) instead of the flat clearance_ttl_s.
+    #: UNMEASURED: unit-pinned only; needs a 60-min replay on walled hosts. Off.
+    clearance_cookie_expiry: bool = False
+    clearance_max_ttl_s: int = 86400
+    #: #192 A challenge cookie scoped to a parent domain is also found for the
+    #: parent's other subdomains.
+    #: UNMEASURED: unit-pinned only; needs the live walled-host leg. Off.
+    clearance_domain_scope: bool = False
+    #: #193 robots.txt / preconnect requests carry the host's persona headers
+    #: instead of httpx's default User-Agent.
+    #: WIN (yield): one User-Agent per host 0/8 -> 8/8; latency neutral (-2.6 ms [-8.2, +2.0]).
+    robots_persona_headers: bool = True
+    #: #195 The engine sidecar's health poll backs off from 10 ms instead of
+    #: sleeping 500 ms; warm_sidecar spawns it during Ladder.warm.
+    #: sidecar_fast_boot WIN: first tier-2 read -492 ms [-505, -486]. warm_sidecar WIN on the
+    #: first read (579 -> 18 ms) but it spawns an engine a session may never use: off.
+    sidecar_fast_boot: bool = True
+    warm_sidecar: bool = False
+    #: #196 A thin / empty-mount page whose raw HTML carries the framework's
+    #: state blob (__NEXT_DATA__, __NUXT_DATA__, Apollo, ...) is answered from
+    #: that blob's text instead of climbing to a browser.
+    #: WIN on the fixture (answered 0/8 -> 8/8, no browser); the text it serves is not yet
+    #: compared with a browser render on live shells, so it stays off.
+    embedded_state_rung: bool = False  # live 2026-11-25: fired on 1 of 20 pages (tiktok profile) and returned 56k chars of UI strings with one content line -- LOSS on quality, stays off
+    embedded_state_min_chars: int = 600
+    #: #197 Safari persona on a current curl_cffi target; persona_host_os
+    #: restricts the pool to personas of this machine's OS family.
+    #: UNMEASURED: block-rate knobs need the live walled-host leg. Off.
+    persona_refresh: bool = False
+    persona_host_os: bool = False
+    #: #198 Cache payloads are zstd-compressed; expired rows are purged on
+    #: open; cache_max_mb > 0 evicts oldest rows past that size.
+    #: cache_compress TRADE: +0.27 ms per page [+0.18, +0.48] for 10,865 -> 2,822 KB on disk.
+    #: Off; purge / cap not measured.
+    cache_compress: bool = False
+    cache_purge_on_open: bool = False
+    cache_max_mb: int = 0
+    #: #199 The swarm's read_page goes through Engine.read (lean reads,
+    #: markdown negotiation, DOI fallback, listings, the prefetch's cache
+    #: entry) instead of a bare ladder fetch.
+    #: WIN: -163 ms [-164, -150] on a prefetched page; second download 6/6 -> 0/6.
+    swarm_read_via_engine: bool = True
+    #: #200 Tool calls of one model turn run concurrently.
+    #: WIN: four 150 ms reads in one turn 642 -> 185 ms (-460 [-472, -453]).
+    parallel_tools: bool = True
+    #: #201 read_page / read_url accept offset, max_chars and focus.
+    #: WIN (yield): a fact 39k chars in is found 0/6 -> 6/6, with 831 chars of context
+    #: instead of 12,112. No cost when the parameters are not used.
+    read_paging: bool = True
+    #: #202 A read returns up to read_links_max absolute links of the page.
+    #: WIN on reach (link seen by the reader 0/6 -> 6/6) but it adds text to every read;
+    #: the LLM leg that prices that is not run. Off.
+    read_links: bool = False  # live 2026-11-25 (deepseek-flash, 3 link-following questions): 3 of 3 answered in both arms, input tokens 158.9k off vs 142.3k on -- NEUTRAL, stays off
+    read_links_max: int = 40
+    #: #203 PDF text through pypdfium2 when installed (pypdf otherwise).
+    #: WIN: three arXiv PDFs 691 -> 62 ms (-613 [-667, -562]), ligatures intact. Uses
+    #: pypdfium2 only when it is installed.
+    pdf_fast_extract: bool = True
+    #: #204 One engine render pass (page scripts run in the engine) is tried
+    #: before the Chromium rescue on a JS-shell verdict.
+    #: WIN on the fixture (client-rendered page answered 0/6 -> 6/6 in 231 ms with #205,
+    #: no Chromium).
+    #: WIN, live corpus against ONE warm Chromium (bench/shells.py --warm, 13
+    #: client-rendered pages): with #216 and #219-#222 the engine matches the
+    #: Chromium text on 12 (httpbin.org misses and falls through to Chromium),
+    #: median 222 ms against 1901 ms. Not measured: whether a bot vendor's
+    #: script run in the engine flags the jar the Chromium rescue shares; the
+    #: rung only runs on a thin / empty-mount / js-required verdict, never on
+    #: a block. Acts only where the engine is the tier-2 primary.
+    engine_render_rung: bool = True
+    engine_render_settle_ms: int = 2500
+    #: #205 The render pass stops when this many pump rounds changed neither
+    #: the DOM nor the network log (0 = always run the whole settle budget).
+    #: WIN: render of a page with a never-ending interval 2529 -> 231 ms (-2298 [-2306, -2284]).
+    engine_render_quiesce: int = 3
+    #: #206 Page fetch/XHR inside an engine render send Referer / Origin.
+    #: WIN (yield): article loaded by XHR from a Referer-checked endpoint 0/6 -> 6/6.
+    engine_page_referer: bool = True
+    #: #207 A binary engine response (a PDF behind the session's cookies)
+    #: rides the envelope as bytes, so no second cookie-less download.
+    #: WIN (yield): PDF behind the engine session's cookie read 0/6 -> 6/6; latency neutral.
+    engine_binary_body: bool = True
+    #: #208 Engine bot-wall signatures count only where they mean something
+    #: (Facebook hosts, inside a tag), not on any page that mentions one.
+    #: WIN on the fixture (an article naming arkoselabs.com read 0/6 -> 6/6), but a real
+    #: wall that names its vendor only in script text would be missed: off until the
+    #: live walled-host leg.
+    engine_bot_scoped: bool = False
+    #: #209 The engine honours the ladder's per-attempt navigation budget.
+    #: LOSS: a stalled origin fails at 6064 ms instead of 4538 ms (+1530 [+1519, +1533]) --
+    #: the early engine timeout feeds the warm-up-and-retry path. Off.
+    engine_deadline: bool = False
+    #: #210 The engine render runs with the browser-globals prelude (URL,
+    #: URLSearchParams, Headers, atob/btoa, XHR events, document.head) and
+    #: fires `load` after DOMContentLoaded.
+    #: WIN (yield): page needing URL / atob / window.onload / XHR onload 0/6 -> 6/6 (+13 ms).
+    engine_render_prelude: bool = True
+    #: #211 Render fetches a page's external scripts together (run order
+    #: kept), skips analytics / ad / consent hosts, and allows 24 scripts of
+    #: 2 MB each instead of 8 of 512 KB.
+    #: WIN: six 150 ms chunks 955 -> 189 ms (-765 [-769, -760]); twelve chunks 0/6 -> 6/6.
+    engine_script_pipeline: bool = True
+    #: #216 Render against a live DOM: a tree of JS objects (one per node, so
+    #: childNodes / siblings / parentNode / ownerDocument, node identity,
+    #: document.implementation, cloneNode, live innerHTML, a selector engine
+    #: and bubbling events all work) instead of snapshots over a re-parsed
+    #: string. Needs engine_render_prelude.
+    #: TRADE: pages built with jQuery, jQuery + document.write, React 18,
+    #: Vue 3 and Svelte 5 go 0/6 -> 6/6 each (+13 to +22 ms); three plain-DOM
+    #: pages keep 6/6 at +5.0 [+2.3, +17.4], +6.8 [-6.5, +19.6] and
+    #: +7.6 [-0.3, +13.0] ms. Live, 13 client-rendered pages: 2 -> 11 match
+    #: the Chromium text (median 216 ms).
+    #: Re-measured in batch two: the cost on a plain-DOM page is +3.1 ms
+    #: [+0.2, +3.7] on a warm engine (12.6 -> 15.0 ms) and +5.2 ms
+    #: [+2.4, +12.9] on the first render of a process; a code cache does not
+    #: remove it (it is tree building, not compile). The 3217 ms page was a
+    #: far timer holding the pump, fixed by #222. WIN on yield; on with #204.
+    engine_live_dom: bool = True
+    #: #212 A meta-refresh inside an HTML comment or a script body is text,
+    #: not a redirect (the engine applies the same rule).
+    #: Correctness fix, unit-pinned on both sides (no latency effect to measure).
+    meta_refresh_strict: bool = True
+    #: #213 The engine leaves through the configured proxy (browser_proxy,
+    #: else proxy), so its address matches the tiers a clearance is shared with.
+    #: UNMEASURED: no proxy on the bench machine. Off.
+    engine_proxy: bool = False
+    #: #214 Decode bodies the way a browser does on every tier: byte-order
+    #: mark, Content-Type charset, <meta> prescan, then a detector for a body
+    #: that declares nothing and is not UTF-8 (tiers 0/1: net/charset.py;
+    #: engine: SE_CHARSET_DETECT). WIN (yield): undeclared windows-1252 /
+    #: Shift_JIS / GBK pages read correctly 0/6 -> 6/6 through the ladder and at
+    #: the engine tier (engine cost +1.5 to +3.3 ms); a <meta>-only page is read
+    #: at tier 0 instead of climbing, -19.9 ms [-36.9, -8.5]. On.
+    charset_detect: bool = True
+    #: #217 The engine carries its requests over a BoringSSL transport set up
+    #: as the Chrome its headers claim (ClientHello, ALPN, h2 SETTINGS /
+    #: WINDOW_UPDATE / pseudo-header order, the priority field) instead of
+    #: rustls (SE_TLS_IMPERSONATE). Needs an se-serve built with the
+    #: `impersonate` cargo feature; `health` reports whether it was.
+    #: WIN (yield): JA4 and the HTTP/2 fingerprint equal Chrome's on the echo
+    #: (rustls: t13d1011h2..., Chrome and this: t13d1516h2_8daaf6152771_...).
+    #: Live, one request per URL per arm: carvana 403 Cloudflare -> 200 with
+    #: 1.34 MB and 128 prices; LinkedIn company page 200 both; carmax,
+    #: cars.com, cargurus, edmunds 403 both (their checks are not the hello).
+    #: Fixture cost +0.4 ms [-0.6, +1.1]. No effect on a binary built without
+    #: the feature.
+    engine_tls_impersonate: bool = True
+    #: #218 A read whose body is large (thin_heavy_min_bytes) but extracts to
+    #: under thin_heavy_max_chars gets one browser pass, and the longer text
+    #: wins. The classifier counts visible text, so a script-built page's
+    #: footer passes as an ok page; extraction is the first place that knows
+    #: the read came out empty. The Doc is stamped meta["thin_heavy"] =
+    #: rescued / still_thin / rescue_failed:<error>, and meta["thin_body"] =
+    #: "<chars>/<bytes>" whether or not a browser pass was allowed.
+    #: TRADE: a 300 KB script-built page with a footer is read 0/4 -> 4/4, at
+    #: +4092 ms [+3577, +4592] (a cold browser launch per trial). Off: a login
+    #: or consent shell with a large script payload would buy the same browser
+    #: pass and stay thin, and that cost on walled pages is not measured.
+    thin_heavy_rescue: bool = True  # on 2026-11-25 by owner decision (quality over the ~4 s browser pass); TRADE on the fixture
+    thin_heavy_min_bytes: int = 200_000
+    thin_heavy_max_chars: int = 300
+    #: #219 In an engine render, a page's fetch() calls are sent at once and
+    #: settle from the event-loop pump (each used to park the one JS thread
+    #: for its whole round trip), and https requests share one keep-alive
+    #: client and runtime (each used to build its own). With
+    #: engine_tls_impersonate the shared client is the browser-TLS one, so a
+    #: page's own requests carry the same hello as its document.
+    #: WIN: ten 150 ms sections 1581 -> 192 ms (-1385.3 [-1409.7, -1382.3]),
+    #: answered 8/8 both; a one-request page +1.1 ms [-1.3, +1.9].
+    engine_fetch_pool: bool = True
+    #: #220 An engine render runs <script type="module">: the static import
+    #: graph is fetched relative to each importer, linked and evaluated after
+    #: the classic scripts; import() works from any script; nomodule
+    #: fallbacks are skipped. Bare specifiers (import maps) are not resolved.
+    #: Needs engine_render_prelude.
+    #: WIN (yield): a module-script page 0/8 -> 8/8 (+12.4 ms [+6.6, +17.2],
+    #: the cost of running it); a classic-script page +0.2 ms [-0.6, +1.6].
+    #: Live: TodoMVC Vue now equals the Chromium text (356 characters).
+    engine_modules: bool = True
+    #: #221 An engine render runs classic scripts as real Scripts (one
+    #: compile, one shared global lexical scope, as a browser) and keeps V8's
+    #: code cache per script URL + content for the life of the engine, so a
+    #: bundle met again skips its parse and compile. Needs
+    #: engine_render_prelude. The engine's own scripts also keep their cache
+    #: on disk (state_dir/engine-code-cache).
+    #: WIN on a first render: a page with a 900 KB bundle 73.6 -> 59.5 ms
+    #: (-13.7 [-15.7, -11.1]), from one compile instead of two. The cache
+    #: itself earns nothing measurable: a second render in one process is
+    #: +1.0 ms [+0.5, +2.0] (V8's own in-isolate cache already hits) and a
+    #: fresh process with the disk copy is -3.0 ms [-15.0, +4.5].
+    engine_code_cache: bool = True
+    #: #222 Quiet window of an engine render, in ms (0 = off): a page whose DOM
+    #: and network have been still this long, with no request in flight and no
+    #: one-shot timer due inside the same span, is done. Without it one far
+    #: setTimeout (an analytics beacon, a session poll) holds the render to
+    #: the end of its budget. A page that builds content from a timer set
+    #: FURTHER away than the window loses that content.
+    #: WIN: page with a 3 s timer left behind 2536 -> 786 ms
+    #: (-1749.8 [-1756.4, -1738.2]), content kept 10/10; timer-rendered page
+    #: +0.5 ms [-1.2, +4.7]; ten fetches in flight -0.2 ms [-7.3, +2.8]. Live:
+    #: the-internet dynamic_content 3394 -> 891 ms, same text.
+    engine_render_quiet_ms: int = 500
+    #: #223 How many V8 isolates the engine may run (1..8), each on its own
+    #: thread and started on first need. With one, a slow render makes every
+    #: other tab's script wait behind it.
+    #: WIN: a quick page asked for during a 1.5 s render waits 1417 -> 11.7 ms
+    #: (-1405.4 [-1411.2, -1398.0]); one page alone +0.4 ms [-0.3, +5.4].
+    engine_isolates: int = 4
 
     # Optional keys. Absent => that adapter stays dormant and is never routed to.
     serpapi_key: str = Field("", repr=False, exclude=True)

@@ -1,6 +1,6 @@
 [project]
 name = "searchio"
-version = "0.1.0"
+version = "0.2.0"
 description = "LLM-assisted search: a research swarm over a blocking-resistant acquisition ladder."
 readme = "README.md"
 license = "Apache-2.0"
@@ -17,6 +17,8 @@ dependencies = [
     # HTML read falls back to a crude tag strip (found 2026-10-28).
     "lxml_html_clean>=0.1",
     "pypdf>=4",
+    # Fast PDF text path (pdf_fast_extract); pypdf stays as the fallback.
+    "pypdfium2>=4",
     "selectolax>=0.3.21,<1.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",

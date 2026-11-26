@@ -332,7 +332,8 @@ def build_server() -> "FastMCP":
         return _to_jsonable(t)
 
     @mcp.tool()
-    async def read_url(url: str) -> dict:
+    async def read_url(url: str, offset: int = 0, max_chars: int = 0,
+                       focus: str = "") -> dict:
         """Fetch one URL through the blocking-resistant acquisition ladder.
 
         Escalates plain HTTP -> TLS impersonation -> stealth browser as the
@@ -340,10 +341,34 @@ def build_server() -> "FastMCP":
 
         Args:
             url: Absolute URL to read.
+            offset: Character offset to start the text at (continue a long
+                page from the ``next_offset`` a previous call returned).
+            max_chars: Return at most this many characters of text (0 = all).
+            focus: Return only the paragraphs matching these words, each
+                prefixed with its ``[@offset]`` in the full text.
         """
         eng = await _engine()
         doc = await _guarded("read_url", eng.read(url.strip()))
-        return _to_jsonable(doc)
+        out = _to_jsonable(doc)
+        if offset or max_chars or focus.strip():
+            from .paging import focus_passages, window
+
+            full = out.get("text") or ""
+            out["total_chars"] = len(full)
+            passages, matched = ("", 0)
+            if focus.strip():
+                passages, matched = focus_passages(full, focus, max_chars or 12_000)
+            if matched:
+                out["text"] = passages
+                out["focus_matches"] = matched
+            else:
+                chunk, _total, nxt = window(full, offset, max_chars)
+                out["text"] = chunk
+                out["offset"] = max(0, min(int(offset or 0), len(full)))
+                out["next_offset"] = nxt
+                if focus.strip():
+                    out["focus_matches"] = 0
+        return out
 
     @mcp.tool()
     async def research(question: str) -> dict:

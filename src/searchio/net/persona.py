@@ -130,6 +130,55 @@ PERSONAS: tuple[Persona, ...] = (
 
 DEFAULT = PERSONAS[0]
 
+#: persona_refresh: the Safari row on a current TLS target. safari17_0 is a
+#: 2023 handshake under a 2023 UA -- consistent, but three majors stale, and
+#: a quarter of all hosts drew it. Same OS token (Safari freezes it).
+SAFARI_CURRENT = Persona(
+    name="safari-mac",
+    impersonate="safari260",
+    ua=(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+    ),
+    sec_ch_ua="",
+    platform="macOS",
+    accept_encoding="gzip, deflate, br",
+)
+
+#: Process-wide switches, set by the Ladder from Settings (the persona API
+#: is called without settings in hand): [persona_refresh, persona_host_os].
+_REFRESH = [False]
+_HOST_OS = [False]
+
+
+def _host_platform() -> str:
+    import sys
+
+    return {"win32": "Windows", "darwin": "macOS"}.get(sys.platform, "")
+
+
+def _safari_target_ok() -> bool:
+    try:
+        from curl_cffi.requests.impersonate import BrowserType
+    except Exception:  # noqa: BLE001 -- optional dependency
+        return False
+    return any(b.value == SAFARI_CURRENT.impersonate for b in BrowserType)
+
+
+def active_personas() -> tuple[Persona, ...]:
+    """The pool ``for_domain`` draws from under the current switches."""
+    pool = PERSONAS
+    if _REFRESH[0] and _safari_target_ok():
+        pool = tuple(SAFARI_CURRENT if p.name == "safari-mac" else p for p in pool)
+    if _HOST_OS[0]:
+        # persona_host_os: a macOS User-Agent over a Windows TCP/IP stack
+        # (TTL, window scaling) is a contradiction a passive fingerprint
+        # reads. Keep the personas of this machine's OS family; a host with
+        # no matching row (Linux) keeps the full pool.
+        mine = tuple(p for p in pool if p.platform == _host_platform())
+        pool = mine or pool
+    return pool
+
 
 def for_domain(domain: str, *, session: str = "") -> Persona:
     """Pick a stable persona for ``domain``.
@@ -141,7 +190,8 @@ def for_domain(domain: str, *, session: str = "") -> Persona:
     """
     seed = f"{session}|{domain}".encode()
     idx = int.from_bytes(hashlib.blake2b(seed, digest_size=2).digest(), "big")
-    return PERSONAS[idx % len(PERSONAS)]
+    pool = active_personas()
+    return pool[idx % len(pool)]
 
 
 def by_name(name: str) -> Persona:

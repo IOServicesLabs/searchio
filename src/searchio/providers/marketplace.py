@@ -120,6 +120,149 @@ def is_product_url(url: str) -> bool:
     return bool(_PATH_ID.search(path))
 
 
+#: items_vehicle_listings: where vehicles are sold. A car is a classified
+#: listing on a results page, not a product page with one SKU, and none of
+#: MARKETPLACES carries one -- "2022 ford f-150 fx4" answered with two eBay
+#: decals after 68 s.
+VEHICLE_SITES: tuple[str, ...] = (
+    "autotrader.com", "cars.com", "cargurus.com", "carmax.com", "carvana.com",
+    "edmunds.com", "truecar.com", "kbb.com", "carfax.com",
+)
+_MAKES = frozenset((
+    "acura", "alfa", "audi", "bmw", "buick", "cadillac", "chevrolet", "chevy", "chrysler", "dodge",
+    "fiat", "ford", "gmc", "honda", "hyundai", "infiniti", "jaguar", "jeep", "kia",
+    "lexus", "lincoln", "maserati", "mazda", "mercedes", "mercedes-benz",
+    "mitsubishi", "nissan", "porsche", "rivian", "subaru", "tesla", "toyota",
+    "volkswagen", "vw", "volvo",
+))
+_VEHICLE_YEAR = re.compile(r"\b(?:19[89]\d|20[0-4]\d)\b")
+#: A part or accessory for a vehicle is a retail product, not a vehicle.
+_NOT_VEHICLE = re.compile(
+    r"\b(?:decals?|stickers?|emblems?|badges?|parts?|accessor\w+|covers?|mats?|liners?|kits?|wheels?|rims?|"
+    r"tires?|grilles?|bumpers?|lights?|lamps?|filters?|manuals?|keys?|fobs?|toys?|diecast|"
+    r"die-cast|models? kit|lego|shirts?|hats?|posters?|brakes?|pads?|rotors?|battery|"
+    r"batteries|wipers?|mirrors?|hitch|tonneau|exhaust|intake|shocks?|struts?)\b", re.I)
+_FOR_SALE = re.compile(r"\b(?:for sale|used|pre-?owned|certified|dealer|near|miles?)\b", re.I)
+_QUERY_STOP = frozenset(("for", "sale", "used", "new", "pre-owned", "preowned", "certified", "near", "me",
+                         "the", "a", "an", "with", "and", "or", "in", "best", "deal", "deals", "price",
+                         "cheap", "cheapest", "package", "pkg", "truck", "car", "suv", "within", "of"))
+
+
+def is_vehicle_query(text: str) -> bool:
+    """A query for a vehicle itself: a make, with a model year or for-sale
+    wording, and no part / accessory word."""
+    low = text.lower()
+    words = set(re.findall(r"[a-z][a-z-]+", low))
+    if not words & _MAKES or _NOT_VEHICLE.search(low):
+        return False
+    return bool(_VEHICLE_YEAR.search(low) or _FOR_SALE.search(low))
+
+
+def vehicle_urls(text: str) -> list[str]:
+    """Results pages for a vehicle query on sites whose URL shape is its
+    make / model / year (each shape seen answering live, 2026-11-25). Used
+    when web search finds no vehicle page: discovery was the single point
+    of failure of the shopping path whenever the search engines refused."""
+    low = text.lower()
+    words = re.findall(r"[a-z0-9][a-z0-9.-]*", low)
+    make = next((w for w in words if w in _MAKES), "")
+    if not make:
+        return []
+    make = {"chevy": "chevrolet", "vw": "volkswagen", "mercedes": "mercedes-benz"}.get(make, make)
+    rest = [w for w in words[words.index(next(w for w in words if w in _MAKES)) + 1:]
+            if w not in _QUERY_STOP and not _VEHICLE_YEAR.fullmatch(w)]
+    if not rest:
+        return []
+    model, extra = rest[0].strip(".-"), " ".join(rest[1:])
+    flat = re.sub(r"[^a-z0-9]", "", model)
+    ym = _VEHICLE_YEAR.search(low)
+    year = ym.group(0) if ym else ""
+    kw = ("?keywordPhrases=" + extra.replace(" ", "+")) if extra else ""
+    if year:
+        return [
+            f"https://www.autotrader.com/cars-for-sale/{year}/{make}/{flat}{kw}",
+            f"https://www.kbb.com/cars-for-sale/used/{year}/{make}/{flat}{kw}",
+            f"https://www.carmax.com/cars/{make}/{model}?year={year}-{year}",
+            f"https://www.carvana.com/cars/{make}-{flat}",
+        ]
+    return [
+        f"https://www.autotrader.com/cars-for-sale/{make}/{flat}{kw}",
+        f"https://www.carmax.com/cars/{make}/{model}",
+        f"https://www.carvana.com/cars/{make}-{flat}",
+    ]
+
+
+def _squash(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def vehicle_items(html: str, page: str, query: str = "") -> list[Item]:
+    """Vehicle listings on a results page as Items, from the same rows a
+    read prints (extract.with_listings). With ``query``, only cars whose row
+    states every query term other than the year and filler words (a package
+    like "fx4" included) are kept; cars of the asked model year win, and
+    only when the page has none are other years returned (marked in meta)."""
+    from ..extract import with_listings
+
+    text = with_listings("", html, page, packages=True)
+    at = text.find("## Listings")
+    if at < 0:
+        return []
+    low = query.lower()
+    years = set(_VEHICLE_YEAR.findall(low))
+    terms = [_squash(w) for w in re.findall(r"[a-z0-9][a-z0-9.-]*", low)
+             if w not in _QUERY_STOP and not _VEHICLE_YEAR.fullmatch(w)]
+    terms = [t for t in terms if len(t) >= 2]
+    domain = urlsplit(page).netloc.lower().removeprefix("www.")
+    out: list[Item] = []
+    other_year: list[Item] = []
+    for line in text[at:].splitlines():
+        if not line.startswith("- "):
+            continue
+        parts = line[2:].split(" | ")
+        name = parts[0]
+        attrs: dict[str, str] = {}
+        price, seller, link = "", "", ""
+        for p in parts[1:]:
+            if p.startswith("$") and not price:
+                price = p
+            elif p.endswith(" mi") and p[:1].isdigit():
+                attrs["mileage"] = p
+            elif p.startswith("VIN "):
+                attrs["vin"] = p[4:]
+            elif p.startswith("distance "):
+                attrs["distance_mi"] = p[9:]
+            elif p.startswith("pkgs: "):
+                attrs["packages"] = p[6:]
+            elif p.startswith("history: "):
+                attrs["history"] = p[9:]
+            elif p.startswith("http"):
+                link = p
+            elif "(" in p and p.endswith(")"):
+                seller, _, where = p[:-1].partition("(")
+                seller = seller.strip()
+                attrs["location"] = where.strip()
+            else:
+                attrs.setdefault("details", "")
+                attrs["details"] = (attrs["details"] + "; " + p).strip("; ")
+        if not attrs.get("vin") or not price:
+            # No VIN: not one car. No price: nothing to compare.
+            continue
+        flat = _squash(line)
+        if any(t not in flat for t in terms):
+            continue
+        year_ok = not years or any(y in name for y in years)
+        (out if year_ok else other_year).append(Item(
+            title=name, url=link or f"{page}#{attrs['vin']}", price=parse_price(price),
+            seller=seller or domain, condition="used" if name.lower().startswith("used") else "",
+            identity=f"vin:{attrs['vin']}", attributes=attrs, source=domain,
+            meta={"extraction": "listing_row", "page": page, **({} if year_ok else {"year_match": False})},
+        ))
+    # The asked model year first; a page with none of that year still answers
+    # with the cars that match everything else (each row states its year).
+    return out or other_year
+
+
 class MarketplaceItems(Provider):
     """Shopping results assembled from web search plus JSON-LD extraction."""
 
@@ -152,6 +295,16 @@ class MarketplaceItems(Provider):
 
     async def find_items(self, q: Query, ctx: ProviderContext) -> list[Item]:
         """Search, fetch candidate product pages in parallel, extract items."""
+        if (getattr(ctx.settings, "items_vehicle_listings", False) and not q.domains
+                and self.domains is MARKETPLACES and is_vehicle_query(q.text)):
+            # A miss (no page, no matching car, every page refused) falls
+            # through to the retail path: the query may not be a vehicle.
+            try:
+                found = await self._vehicles(q, ctx)
+            except Exception:  # noqa: BLE001
+                found = []
+            if found:
+                return found
         docs = await self._discover(q, ctx)
         # Engines honour `site:` loosely at best, and a generalist fan-out will
         # happily return the Wikipedia article about the manufacturer. Only
@@ -185,6 +338,80 @@ class MarketplaceItems(Provider):
                 self.name,
                 f"all {len(candidates)} product pages failed: " + "; ".join(failures)[:400],
             )
+        return items
+
+    #: items_vehicle_listings: results pages read per query, and how long one
+    #: may take (a page behind a browser-only wall must not hold the answer).
+    VEHICLE_PAGES = 5
+    VEHICLE_BUDGET_S = 30.0
+
+    async def _vehicles(self, q: Query, ctx: ProviderContext) -> list[Item]:
+        """A vehicle query: results pages on the vehicle marketplaces, one
+        Item per car (VIN-keyed, so two trucks never merge), cheapest first."""
+        text = q.text if _FOR_SALE.search(q.text) else f"{q.text} for sale"
+        docs: list[Doc] = []
+        router = getattr(ctx, "router", None)
+        if router is not None:
+            # Unscoped first: eight ``site:`` terms make a 29-word query that
+            # one engine rejected as prose and another blocked (live), while
+            # the plain query's first page is vehicle marketplaces anyway.
+            try:
+                res = await router.search(Query(text=text, intent="web", k=max(q.k * 2, 12)),
+                                          allow_expensive=False)
+                docs = [d for d in res.docs if _domain_allowed(d.domain, VEHICLE_SITES)]
+            except Exception:  # noqa: BLE001 -- the scoped search decides
+                docs = []
+        if not docs:
+            try:
+                docs = await self._discover(
+                    Query(text=text, intent="shopping", k=q.k, domains=list(VEHICLE_SITES)), ctx)
+            except Exception:  # noqa: BLE001 -- the direct pages below still answer
+                docs = []
+        if not any(_domain_allowed(d.domain, VEHICLE_SITES) for d in docs):
+            # No engine found a vehicle page (or every engine refused): ask
+            # the marketplaces directly.
+            docs = [Doc(url=u, title=q.text, source=self.name) for u in vehicle_urls(q.text)]
+        seen: set[str] = set()
+        pages: list[Doc] = []
+        for d in docs:
+            # One page per site first: each site's results repeat across its URLs.
+            if _domain_allowed(d.domain, VEHICLE_SITES) and d.domain not in seen:
+                seen.add(d.domain)
+                pages.append(d)
+        pages = pages[: self.VEHICLE_PAGES]
+        if not pages:
+            return []
+
+        async def one(d: Doc) -> list[Item]:
+            res = await ctx.ladder.fetch(d.url)
+            page = res.final_url or d.url
+            loop = asyncio.get_running_loop()
+            items = await loop.run_in_executor(None, vehicle_items, res.body or "", page, q.text)
+            for it in items:
+                it.meta["tier"] = res.tier
+            return items
+
+        # One deadline for all pages, and no waiting on a cancelled fetch to
+        # unwind (wait_for does; a browser pass took 90 s to let go live): the
+        # pages that answered in time are the answer.
+        tasks = [asyncio.ensure_future(one(d)) for d in pages]
+        done, pending = await asyncio.wait(tasks, timeout=self.VEHICLE_BUDGET_S)
+        for t in pending:
+            t.add_done_callback(lambda f: f.cancelled() or f.exception())
+            t.cancel()
+        results = [t.exception() or t.result() if t in done and not t.cancelled()
+                   else asyncio.TimeoutError(f"over {self.VEHICLE_BUDGET_S:.0f} s") for t in tasks]
+        items: list[Item] = []
+        failures: list[str] = []
+        for d, r in zip(pages, results):
+            if isinstance(r, BaseException):
+                failures.append(f"{d.domain}: {type(r).__name__}: {str(r)[:80]}")
+            else:
+                items.extend(r)
+        if failures and len(failures) == len(pages):
+            raise ProviderError(
+                self.name, f"all {len(pages)} vehicle pages failed: " + "; ".join(failures)[:400])
+        items.sort(key=lambda it: it.price.amount if it.price.amount is not None else float("inf"))
         return items
 
     async def _discover(self, q: Query, ctx: ProviderContext) -> list[Doc]:

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import base64
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict, deque
@@ -71,6 +72,7 @@ from ..errors import (
     TransientError,
 )
 from ..models import FetchResult
+from . import charset as charset_mod
 from . import pdf as pdf_mod
 from . import persona as persona_mod
 from .blocks import _looks_like_challenge, classify
@@ -80,6 +82,8 @@ from .clearance import (
     RETAINED_COOKIES,
     TRUST_COOKIES,
     ClearanceStore,
+    cookie_expiry,
+    parent_scoped,
     relevant_cookies,
 )
 from .profiles import DomainStore
@@ -180,6 +184,19 @@ _META_REFRESH_MAX_HOPS = 10    # mirrors the HTTP redirect budget
 _META_REFRESH_MAX_DELAY_S = 5.0  # above this the interstitial IS the document
 _META_HEAD_BYTES = 65536       # the refresh contract lives in the head window
 _META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I)
+#: meta_refresh_strict (set by the Ladder): comments and script bodies are
+#: blanked before the scan.
+_META_STRICT = [False]
+_NON_MARKUP_RE = re.compile(
+    r"<!--.*?(?:-->|\Z)|(<script\b[^>]*>)(.*?)(?=</script|\Z)", re.I | re.S)
+
+
+def _mask_non_markup(head: str) -> str:
+    def blank(m: re.Match) -> str:
+        if m.group(1) is None:
+            return " " * len(m.group(0))
+        return m.group(1) + " " * len(m.group(2))
+    return _NON_MARKUP_RE.sub(blank, head)
 _META_ATTR_RE = r"\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))"
 
 
@@ -213,7 +230,10 @@ def _meta_refresh_target(
     """
     if status != 200 or "html" not in content_type.lower():
         return None
-    for m in _META_TAG_RE.finditer(text[:_META_HEAD_BYTES]):
+    head = text[:_META_HEAD_BYTES]
+    if _META_STRICT[0]:
+        head = _mask_non_markup(head)
+    for m in _META_TAG_RE.finditer(head):
         tag = m.group(0)
         equiv = _meta_attr(tag, "http-equiv")
         if equiv is None or equiv.strip().lower() != "refresh":
@@ -1039,10 +1059,18 @@ class Ladder:
         self._pool = ThreadPoolExecutor(
             max_workers=max(4, int(self.s.global_concurrency)), thread_name_prefix="searchio-blocking")
 
-        self.cache = Cache(self.s.cache_path(), self.s.cache_ttl_s, self.s.cache_enabled)
+        self.cache = Cache(
+            self.s.cache_path(), self.s.cache_ttl_s, self.s.cache_enabled,
+            compress=bool(getattr(self.s, "cache_compress", False)),
+            purge_on_open=bool(getattr(self.s, "cache_purge_on_open", False)),
+            max_mb=int(getattr(self.s, "cache_max_mb", 0) or 0),
+        )
         self.profiles = DomainStore(self.s.profile_path())
         self.clearance = ClearanceStore(
-            self.s.clearance_path(), self.s.clearance_enabled, self.s.clearance_ttl_s
+            self.s.clearance_path(), self.s.clearance_enabled, self.s.clearance_ttl_s,
+            max_ttl_s=(int(getattr(self.s, "clearance_max_ttl_s", 0) or 0)
+                       if getattr(self.s, "clearance_cookie_expiry", False) else 0),
+            domain_scope=bool(getattr(self.s, "clearance_domain_scope", False)),
         )
         # Seeded browser sessions (docs/SESSIONS.md): the platform's login
         # jars. An unset sessions_dir is a store that always misses -- nothing
@@ -1092,6 +1120,24 @@ class Ladder:
         from . import sidecar as _sc
 
         _sc._FAST_PROBE[0] = bool(getattr(self.s, "sidecar_fast_probe", False))
+        _sc._FAST_BOOT[0] = bool(getattr(self.s, "sidecar_fast_boot", False))
+        persona_mod._REFRESH[0] = bool(getattr(self.s, "persona_refresh", False))
+        persona_mod._HOST_OS[0] = bool(getattr(self.s, "persona_host_os", False))
+        pdf_mod._FAST[0] = bool(getattr(self.s, "pdf_fast_extract", False))
+        _META_STRICT[0] = bool(getattr(self.s, "meta_refresh_strict", False))
+        charset_mod._ON[0] = bool(getattr(self.s, "charset_detect", False))
+        _sc._ENGINE_ENV["SE_CHARSET_DETECT"] = "1" if charset_mod._ON[0] else ""
+        _sc._ENGINE_ENV["SE_TLS_IMPERSONATE"] = (
+            "1" if getattr(self.s, "engine_tls_impersonate", False) else "")
+        iso = int(getattr(self.s, "engine_isolates", 1) or 1)
+        _sc._ENGINE_ENV["SE_JS_ISOLATES"] = str(min(iso, 8)) if iso > 1 else ""
+        # engine_code_cache: the engine's own scripts keep their compiled
+        # form between processes, beside the rest of the state.
+        _sc._ENGINE_ENV["SE_CODE_CACHE_DIR"] = (
+            str(self.s.state_dir / "engine-code-cache")
+            if getattr(self.s, "engine_code_cache", False) else "")
+        _sc._ENGINE_PROXY[0] = (
+            (self.s.browser_proxy or self.s.proxy) if getattr(self.s, "engine_proxy", False) else "")
         from . import dnsrace as _dr
 
         _dr.NX_FAST[0] = bool(getattr(self.s, "dns_nx_fast", False))
@@ -1273,8 +1319,15 @@ class Ladder:
             # knobs -- share one climb: a swarm's workers searching the same
             # thing used to send the same SERP request N times, each paying
             # the limiter and each a fresh block signal.
+            # The task-scoped variants are part of the identity too: a
+            # plain fetch that joined an in-flight markdown-negotiated one
+            # received the markdown body (and a budget-cut PDF, a soft-capped
+            # page). A soft cap reports through its own out-list, so it never
+            # shares at all.
+            soft = BODY_SOFT_CAP.get()
             key = (url, max_tier, force_tier, use_cache, referer, rendered,
-                   _FETCH_SESSION.get())
+                   _FETCH_SESSION.get(), bool(ACCEPT_MD.get()), PDF_CHAR_BUDGET.get(),
+                   id(soft) if soft is not None else 0, bool(COND_HEADERS.get()))
             while True:
                 fut = self._inflight.get(key)
                 if fut is None:
@@ -1446,6 +1499,17 @@ class Ladder:
             # included, rode through shared cookies. Tier 0/1 keep per-
             # tenant jars; the browser is reached only when actually refused.
             start = 0
+        if (force_tier is None and start == 2 and not rendered
+                and getattr(self.s, "clearance_start_tier", False)
+                and not self._rendered_first(dom) and not self._learned_first(dom)):
+            # clearance_start_tier: the profile opens this host at the
+            # browser because the cheap tiers drew a wall -- but a challenge
+            # cookie banked since is exactly what makes tier 1 pass. Without
+            # this the cookie was only ever replayed on the 1-in-12 probe.
+            banked = self.clearance.get(dom)
+            if banked is not None and banked.has_challenge_cookie():
+                start = 1
+                self._bump("clearance_start_tier1")
         #: Adaptive-host opener (probe ec52690, config comment on
         #: ``rendered_first_domains``): hosts in that class 429 the initial
         #: document and serve content only after browser-grade behavior, so
@@ -1509,6 +1573,7 @@ class Ladder:
         #: Whether the current tier-2 pass (if tier 2 is where we are) goes
         #: through the challenge sidecar instead of the primary one.
         rendered_pass = bool(rendered) or opener
+        engine_render_tried = False
         fallback_pending = opener
 
         tier = 2 if opener else start
@@ -1718,7 +1783,7 @@ class Ladder:
                     # now -- the ok path only banks after classify, and a
                     # gated PDF's refetch drew the wall again
                     # (pdf_text:refetch_failed; iteration 31).
-                    await self._capture_clearance(dom, self._client_for(rendered_pass))
+                    await self._bank_clearance(dom, self._client_for(rendered_pass))
                 text, stamp = await self._pdf_text(final_url or url)
                 if text is not None:
                     self.limiter.record_success(dom)
@@ -1785,7 +1850,7 @@ class Ladder:
                 if tier == 2:
                     # The browser just paid for a challenge. Bank the cookie
                     # so the next page on this host costs a tier-1 request.
-                    await self._capture_clearance(dom, self._client_for(rendered_pass))
+                    await self._bank_clearance(dom, self._client_for(rendered_pass))
                 await robots_landing_gate(final_url, escalations)
                 out = FetchResult(
                     url=url,
@@ -1810,6 +1875,87 @@ class Ladder:
                 return out
 
             escalations.append(f"tier{tier}:{verdict.reason}")
+
+            if (
+                getattr(self.s, "embedded_state_rung", False)
+                and not verdict.blocked
+                and 200 <= status < 300
+                and not (tier == 2 and rendered_pass)
+                and verdict.reason.startswith(("too_thin", "empty_mount", "js_required"))
+            ):
+                # embedded_state_rung: the shell's content is usually already
+                # in the document as the framework's serialised state. Read
+                # it there before paying a browser to turn it into DOM.
+                from .embedded import embedded_state_html
+
+                state_html = await asyncio.get_running_loop().run_in_executor(
+                    self._pool, embedded_state_html, body,
+                    int(getattr(self.s, "embedded_state_min_chars", 600)))
+                if state_html:
+                    self.limiter.record_success(dom)
+                    self.profiles.record_success(dom, tier)
+                    self._bump("embedded_state_ok")
+                    escalations.append(f"tier{tier}:embedded_state")
+                    await robots_landing_gate(final_url, escalations)
+                    out = FetchResult(
+                        url=url,
+                        final_url=final_url or url,
+                        status=status,
+                        body=state_html,
+                        content_type="text/html; charset=utf-8",
+                        tier=tier,
+                        via=TIER_NAMES.get(tier, str(tier)),
+                        elapsed_ms=int((time.monotonic() - started) * 1000),
+                        escalations=escalations,
+                        rendered=False,
+                    )
+                    if use_cache and session is None:
+                        self._cache_put(url, out.model_dump(exclude={"from_cache"}),
+                                        variant=self._cache_variant(rendered), tier=tier)
+                    return out
+
+            if (
+                tier == 2
+                and not rendered_pass
+                and not engine_render_tried
+                and not verdict.blocked
+                and getattr(self.s, "engine_render_rung", False)
+                and self._primary_kind() == "engine"
+                and verdict.reason.startswith(("too_thin", "empty_mount", "js_required"))
+            ):
+                # engine_render_rung: run the page's own scripts in the engine
+                # (tens of ms, no browser) before paying for Chromium. One
+                # try per fetch; a miss falls through to the rescue below.
+                engine_render_tried = True
+                got = await self._engine_render(url)
+                if got is not None:
+                    r_status, r_body, r_ctype, r_final = got
+                    v2 = classify(r_status, {"content-type": r_ctype}, r_body,
+                                  content_type=r_ctype, min_text=self.s.min_text_chars)
+                    if v2.ok:
+                        self.limiter.record_success(dom)
+                        self.profiles.record_success(dom, tier)
+                        self._bump("engine_render_ok")
+                        escalations.append("tier2:engine_rendered")
+                        await robots_landing_gate(r_final, escalations)
+                        out = FetchResult(
+                            url=url,
+                            final_url=r_final or url,
+                            status=r_status,
+                            body=r_body,
+                            content_type=r_ctype,
+                            tier=tier,
+                            via=TIER_NAMES.get(tier, str(tier)),
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            escalations=escalations,
+                            rendered=False,
+                        )
+                        if use_cache and session is None:
+                            self._cache_put(url, out.model_dump(exclude={"from_cache"}),
+                                            variant=self._cache_variant(rendered), tier=tier)
+                        return out
+                self._bump("engine_render_miss")
+                escalations.append("tier2:engine_render_miss")
 
             # One-shot fidelity rescue: the engine answered tier 2 but with a
             # shell (or drew a managed-challenge block) -- classes of failure
@@ -1851,10 +1997,11 @@ class Ladder:
             if verdict.blocked:
                 # A replayed cookie that draws a 403 is worse than none:
                 # it wastes the tier and looks like a stolen session.
-                if tier < 2:
+                if tier < 2 and not (tier == 0 and self._tier0_withholds(dom)):
                     # Only the clearance this attempt could have replayed
                     # (bug 143): one banked meanwhile by another caller's
-                    # rescue is not the one that drew the 403.
+                    # rescue is not the one that drew the 403. (And with
+                    # clearance_skip_tier0, tier 0 replayed nothing at all.)
                     self.clearance.drop(dom, older_than=attempt_started)
                 if (wall_snap is None and getattr(self.s, "wall_refund", False)
                         and hasattr(self.limiter, "snapshot")):
@@ -1996,7 +2143,7 @@ class Ladder:
             if tier == 2:
                 # A browser that got through still earned its cookie, even if
                 # the page it returned was too thin for the content heuristic.
-                await self._capture_clearance(dom, self._client_for(best_challenge))
+                await self._bank_clearance(dom, self._client_for(best_challenge))
             return FetchResult(
                 url=url,
                 final_url=final_url or url,
@@ -2182,8 +2329,16 @@ class Ladder:
         try:
             await asyncio.get_running_loop().run_in_executor(self._pool, _first_use_imports)
             await self._client()
-            await asyncio.gather(*(self.robots.check(o.rstrip("/") + "/") for o in origins),
-                                 return_exceptions=True)
+            jobs = [self.robots.check(o.rstrip("/") + "/") for o in origins]
+            if (getattr(self.s, "warm_sidecar", False) and self.s.max_tier >= 2
+                    and self.s.sidecar_autostart
+                    and getattr(self.sidecar, "binary", None) is not None):
+                # warm_sidecar: the engine boots in milliseconds; spawning it
+                # here takes that (and the health round trip) off the first
+                # tier-2 read. Engine only -- a Chromium launch is not a
+                # cost to pay on spec.
+                jobs.append(self.sidecar.ensure())
+            await asyncio.gather(*jobs, return_exceptions=True)
         except Exception:  # noqa: BLE001 -- warm-up is an optimization
             pass
 
@@ -2656,7 +2811,7 @@ class Ladder:
             # A jar-carrying request carries exactly one identity: the jar's
             # pinned UA, and NO clearance -- see _session_headers.
             headers = self._session_headers(session, headers, url)
-        else:
+        elif not self._tier0_withholds(dom, count=True):
             headers = self._clearance_headers(dom, headers, url)
         cond = COND_HEADERS.get()
         if cond:
@@ -2687,7 +2842,10 @@ class Ladder:
                 # wins, utf-8-lossy otherwise (a meta-only charset mojibakes
                 # here -- classify's guard refuses it and the climb reaches
                 # the engine tier whose meta prescan decodes; bug-23 shape).
-                text = raw.decode(r.charset_encoding or "utf-8", errors="replace")
+                # charset_detect (#214) adds BOM, the meta prescan and a
+                # detector here, so the page is read without the climb.
+                text = charset_mod.decode(raw, r.charset_encoding,
+                                          r.headers.get("content-type", ""))
                 # Bank any trust/clearance names this response set, so the
                 # next fetch on this host opens warm (trust-cookie jar). The
                 # request UA -- persona or clearance-pinned -- is what the
@@ -2888,8 +3046,7 @@ class Ladder:
                             raise TransientError(
                                 f"too_large: decoded body exceeds cap {cap}")
                         chunks.append(chunk)
-                    text = b"".join(chunks).decode(
-                        _header_charset(ct) or "utf-8", errors="replace")
+                    text = charset_mod.decode(b"".join(chunks), _header_charset(ct), ct)
                     return (
                         r.status_code,
                         dict(r.headers),
@@ -3011,6 +3168,57 @@ class Ladder:
         """
         return await self._tier2_via(self._client_for(rendered), url, session=session)
 
+    async def _engine_render(self, url: str) -> tuple[int, str, str, str] | None:
+        """One engine pass with the page's scripts run: ``(status, html,
+        content_type, final_url)``, or None when the pass failed or drew a
+        wall. On a tab of its own, closed afterwards."""
+        client = self.sidecar
+        tab_id = f"render-{uuid.uuid4().hex[:10]}"
+        params: dict[str, Any] = {
+            "url": url, "tab_id": tab_id, "render": True,
+            "settle_ms": int(getattr(self.s, "engine_render_settle_ms", 2500)),
+        }
+        q = int(getattr(self.s, "engine_render_quiesce", 0) or 0)
+        if q > 0:
+            params["quiesce"] = q
+        if getattr(self.s, "engine_page_referer", False):
+            params["page_referer"] = True
+        if getattr(self.s, "engine_render_prelude", False):
+            params["prelude"] = True
+        if getattr(self.s, "engine_script_pipeline", False):
+            params["script_pipeline"] = True
+        if getattr(self.s, "engine_live_dom", False):
+            params["live_dom"] = True
+        if getattr(self.s, "engine_fetch_pool", False):
+            params["fetch_pool"] = True
+        if getattr(self.s, "engine_modules", False):
+            params["modules"] = True
+        if getattr(self.s, "engine_code_cache", False):
+            params["code_cache"] = True
+        quiet = int(getattr(self.s, "engine_render_quiet_ms", 0) or 0)
+        if quiet > 0:
+            params["quiet_ms"] = quiet
+        if getattr(self.s, "engine_bot_scoped", False):
+            params["bot_scoped"] = True
+        try:
+            res = await client.call("fetch", params, timeout=self.s.tier2_timeout_s)
+        except Exception:  # noqa: BLE001 -- a failed rung is a miss, never a failed fetch
+            return None
+        finally:
+            try:
+                await client.call("close_tab", {"tab_id": tab_id})
+            except Exception:  # noqa: BLE001
+                pass
+        if not isinstance(res, dict) or self._sidecar_refused(res):
+            return None
+        html = res.get("html")
+        if not isinstance(html, str) or not html:
+            return None
+        self._stats["engine_render_ms"] = (self._stats.get("engine_render_ms", 0)
+                                           + int(res.get("render_ms") or 0))
+        ctype = str(res.get("content_type") or "") or "text/html"
+        return int(res.get("status") or 200), html, ctype, str(res.get("url") or url)
+
     async def _tier2_via(self, client: SidecarClient, url: str,
                          session: SiteSession | None = None) -> tuple[int, dict, str, str, str]:
         # One budget, caller-owned: a third of the tier budget per navigation
@@ -3093,11 +3301,38 @@ class Ladder:
         # full load event; its hydration wait covers late client data).
         # The engine backend has no such knob and is never sent one.
         wait = getattr(self.s, "tier2_wait_until", "")
-        kw = {"wait_until": wait} if wait and getattr(client, "binary", None) is None else {}
+        is_engine = getattr(client, "binary", None) is not None
+        kw = {"wait_until": wait} if wait and not is_engine else {}
+        nav_ms: int | None = int(self.s.tier2_timeout_s * 1000 / 3)
+        if is_engine:
+            extra = {}
+            if getattr(self.s, "engine_binary_body", False):
+                extra["binary"] = True
+            if getattr(self.s, "engine_bot_scoped", False):
+                extra["bot_scoped"] = True
+            if extra:
+                kw["extra"] = extra
+            if not getattr(self.s, "engine_deadline", False):
+                nav_ms = None  # the engine keeps its own client timeouts
         res = await client.fetch(
             url, tab_id=tab_id, timeout=self.s.tier2_timeout_s,
-            timeout_ms=int(self.s.tier2_timeout_s * 1000 / 3), **kw,
+            timeout_ms=nav_ms, **kw,
         )
+        b64 = res.get("body_base64") if isinstance(res, dict) else None
+        if b64:
+            # engine_binary_body: the file as the session received it. Stashed
+            # where _pdf_text looks first, so the extract needs no second,
+            # cookie-less download.
+            try:
+                raw = base64.b64decode(b64)
+            except Exception:  # noqa: BLE001 -- a bad envelope is not a failed fetch
+                raw = b""
+            if raw:
+                self._bump("engine_binary_body")
+                for key in {url, str(res.get("url") or url)}:
+                    self._pdf_raw[key] = raw
+                while len(self._pdf_raw) > 4:
+                    self._pdf_raw.pop(next(iter(self._pdf_raw)))
 
         nav_err = _nav_error_landing(res)
         if nav_err:
@@ -3129,7 +3364,7 @@ class Ladder:
                 # bug 159): the refetch used to navigate "default" again.
                 res = await client.fetch(
                     url, tab_id=tab_id, timeout=self.s.tier2_timeout_s,
-                    timeout_ms=int(self.s.tier2_timeout_s * 1000 / 3),
+                    timeout_ms=nav_ms, **({"extra": kw["extra"]} if "extra" in kw else {}),
                 )
                 nav_err = _nav_error_landing(res)
                 if nav_err:
@@ -3243,8 +3478,50 @@ class Ladder:
 
     # ── helpers ──────────────────────────────────────────────────────────────
 
-    async def _capture_clearance(self, domain: str, client: SidecarClient) -> str:
+    def _tier0_withholds(self, dom: str, *, count: bool = False) -> bool:
+        """clearance_skip_tier0: tier 0 presents httpx's TLS under a Chrome
+        UA, so a challenge cookie replayed there is judged against the wrong
+        client -- and its 403 used to drop a clearance tier 1 would have
+        cleared with. True when this host's banked row holds such a cookie
+        and the knob is on: tier 0 then neither sends nor discredits it."""
+        if not getattr(self.s, "clearance_skip_tier0", False):
+            return False
+        c = self.clearance.get(dom)
+        if c is None or not c.has_challenge_cookie():
+            return False
+        if count:
+            self._bump("clearance_tier0_withheld")
+        return True
+
+    async def _bank_clearance(self, domain: str, client: SidecarClient) -> str:
+        """The success path's capture. With ``clearance_capture_bg`` the page
+        is not held for the 6 s settle: the jar is read once inline (ms), and
+        an empty read schedules the settle re-read in the background -- or
+        skips it when the pass ran no page scripts (the engine without
+        render: nothing can set a cookie after the response)."""
+        if not getattr(self.s, "clearance_capture_bg", False):
+            return await self._capture_clearance(domain, client)
+        if not self.clearance.enabled:
+            return "empty"  # nothing can be banked: do not even read the jar
+        out = await self._capture_clearance(domain, client, phase="first")
+        if out != "pending":
+            return out
+        if getattr(client, "binary", None) is not None:
+            self._bump("clearance_capture_settle_skipped")
+            return "empty"
+        t = asyncio.ensure_future(self._capture_clearance(domain, client, phase="settle"))
+        self._bg.add(t)
+        t.add_done_callback(self._bg_done)
+        return "pending"
+
+    async def _capture_clearance(self, domain: str, client: SidecarClient,
+                                 *, phase: str = "full") -> str:
         """Bank the retained cookies the browser just earned for this host.
+
+        ``phase``: ``full`` reads, and on an empty jar settles 6 s and reads
+        again (the original behaviour); ``first`` does the first read only
+        and answers ``pending`` when it is empty; ``settle`` does the
+        delayed re-read only (see :meth:`_bank_clearance`).
 
         ``client`` is whichever sidecar served the pass: a cf_clearance
         earned by patchright lives in patchright's jar, not the engine's.
@@ -3267,9 +3544,14 @@ class Ladder:
         the sensor never set them at all.
         """
         try:
-            jar = await client.cookies()
-            cookies = relevant_cookies(jar, domain)
+            jar: list | None = None
+            cookies: dict[str, str] = {}
+            if phase != "settle":
+                jar = await client.cookies()
+                cookies = relevant_cookies(jar, domain)
             settled = False
+            if not cookies and phase == "first":
+                return "pending"
             if not cookies:
                 # Settle retry: cheap (one jar read after 6s), runs only on
                 # the empty path, and turns a timing race into a banked row
@@ -3281,7 +3563,9 @@ class Ladder:
                 settled = True
             if cookies:
                 ua = await client.user_agent()
-                self.clearance.put(domain, cookies, ua)
+                self.clearance.put(domain, cookies, ua,
+                                   expires=cookie_expiry(jar or [], domain),
+                                   scoped=parent_scoped(jar or [], domain))
                 self._bump("clearance_captured")
                 if settled:
                     self._bump("clearance_capture_banked_after_settle")
@@ -3453,7 +3737,15 @@ class Ladder:
         same SSRF shape as any page redirect.
         """
         try:
-            r = await self._open_stream(url, {}, 8.0)
+            headers: dict[str, str] = {}
+            if getattr(self.s, "robots_persona_headers", False):
+                # robots_persona_headers: this request shares the pooled H2
+                # connection the persona'd document GET reuses next, so it
+                # must not announce "python-httpx" on it first.
+                p = persona_mod.for_domain(domain_of(url), session=self.session_id)
+                headers = persona_mod.safari_headers_fix(
+                    p, p.headers(contact=self.s.user_agent_contact))
+            r = await self._open_stream(url, headers, 8.0)
             try:
                 # RFC 9309: only the first 500 KiB of a robots.txt is
                 # parsed anyway -- truncate there rather than refuse.

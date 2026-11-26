@@ -17,6 +17,8 @@ gracefully or returns nothing.
 
 from __future__ import annotations
 
+import asyncio
+
 
 from ..models import SubTask, WorkerReport
 from .budget import Budget
@@ -84,6 +86,40 @@ class Worker:
         #: the fallback report's error field (bug 64).
         self._force_failure = ""
 
+    @staticmethod
+    async def _dispatch_parallel(bridge, tool_uses, max_calls: int) -> list:
+        """parallel_tools: run one turn's tool calls concurrently.
+
+        The serial loop's rules hold exactly: a call past the budget does
+        not execute (counted in turn order, before anything runs), nothing
+        after a submit_report executes, and submit_report itself runs last
+        -- after the research calls it was issued with have finished -- so
+        the report sees their results.
+        """
+        slots: list = [None] * len(tool_uses)
+        jobs: list[int] = []
+        planned = bridge.calls
+        terminal = None
+        for i, tu in enumerate(tool_uses):
+            if bridge.report is not None or terminal is not None:
+                slots[i] = ("Report already submitted; this call was not executed.", True)
+            elif tu.name == "submit_report":
+                terminal = i
+            elif planned >= max_calls:
+                slots[i] = (f"Tool budget of {max_calls} calls is exhausted; this call "
+                            "was not executed. Call submit_report with what you have.", True)
+            else:
+                planned += 1
+                jobs.append(i)
+        done = await asyncio.gather(
+            *(bridge.dispatch(tool_uses[i].name, tool_uses[i].input) for i in jobs))
+        for i, r in zip(jobs, done):
+            slots[i] = r
+        if terminal is not None:
+            slots[terminal] = await bridge.dispatch(
+                tool_uses[terminal].name, tool_uses[terminal].input)
+        return slots
+
     async def run(self) -> WorkerReport:
         bridge = ToolBridge(self.engine, subtask_id=self.subtask.id)
         messages: list[dict] = [{"role": "user", "content": self._prompt()}]
@@ -148,7 +184,12 @@ class Worker:
             # message; splitting them teaches the model to stop calling tools
             # in parallel.
             results = []
-            for tu in tool_uses:
+            from ..config import get_settings
+
+            pre: list | None = None
+            if getattr(get_settings(), "parallel_tools", False) and len(tool_uses) > 1:
+                pre = await self._dispatch_parallel(bridge, tool_uses, max_calls)
+            for n, tu in enumerate(tool_uses):
                 # Every tool_use id needs a tool_result (the API rejects the
                 # next turn otherwise), but nothing EXECUTES past the cap or
                 # after a report exists (bug 63): the cap was checked only at
@@ -157,7 +198,9 @@ class Worker:
                 # submit_report in the same turn ran after the report was
                 # built. submit_report itself is always allowed -- it is the
                 # terminal step the force-submit would spend an extra call on.
-                if bridge.report is not None:
+                if pre is not None:
+                    text, is_error = pre[n]
+                elif bridge.report is not None:
                     text, is_error = ("Report already submitted; this call was "
                                       "not executed."), True
                 elif bridge.calls >= max_calls and tu.name != "submit_report":

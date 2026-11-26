@@ -23,8 +23,27 @@ from ..models import Citation, Doc, Finding, Item, WorkerReport
 
 #: Hard cap on page text handed back to a model, in characters.
 PAGE_CHAR_LIMIT = 12_000
+#: read_links: how many of a page's links a read_page result lists.
+LINKS_SHOWN = 15
 SNIPPET_LIMIT = 240
 TITLE_LIMIT = 200
+
+
+#: read_paging: the two optional read_page inputs (see :func:`tool_defs`).
+_PAGING_SCHEMA = {
+    "offset": {
+        "type": "integer",
+        "description": ("Character offset to start at. A truncated result names "
+                        "the offset that continues it."),
+    },
+    "focus": {
+        "type": "string",
+        "description": ("A few keywords. Returns only the paragraphs of the page "
+                        "that mention them (each with its [@offset]) instead of "
+                        "the first 12000 characters. Use it on long pages."),
+    },
+}
+_PAGING_PROPS: dict = {}
 
 
 def tool_defs() -> list[dict]:
@@ -34,6 +53,13 @@ def tool_defs() -> list[dict]:
     loop below parses them with ``json.loads`` regardless, because escaping in
     tool arguments is not something to pattern-match on.
     """
+    from ..config import get_settings
+
+    # read_paging adds two optional inputs to read_page; off, the schema is
+    # byte-identical to what it always was.
+    _PAGING_PROPS.clear()
+    if getattr(get_settings(), "read_paging", False):
+        _PAGING_PROPS.update(_PAGING_SCHEMA)
     return [
         {
             "name": "web_search",
@@ -110,6 +136,7 @@ def tool_defs() -> list[dict]:
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Absolute http(s) URL."},
+                    **_PAGING_PROPS,
                 },
                 "required": ["url"],
                 "additionalProperties": False,
@@ -354,14 +381,31 @@ class ToolBridge:
         url = str(args.get("url", ""))
         if not url.startswith("http"):
             return "Invalid URL: must be absolute http(s).", True
+        from ..config import get_settings
+
+        s = getattr(self.engine, "s", None) or get_settings()
+        paging = bool(getattr(s, "read_paging", False))
+        want_links = bool(getattr(s, "read_links", False))
+        via_engine = (bool(getattr(s, "swarm_read_via_engine", False)) and not rendered
+                      and hasattr(self.engine, "read"))
+        res = None
+        read_doc = None
         try:
-            # rendered=True forces tier 2: the tool's contract IS a browser
-            # pass. Letting a cheap tier answer re-serves the exact shell the
-            # model just escalated away from (bench/span.py llm.price_check:
-            # the same Amazon shell three times, rendered budget burned).
-            res = await self.engine.ladder.fetch(
-                url, rendered=rendered, force_tier=2 if rendered else None
-            )
+            if via_engine:
+                # swarm_read_via_engine: the same path the MCP tool and the
+                # CLI take -- lean reads, markdown negotiation, DOI fallback,
+                # listings, and the cache entry the search's prefetch wrote
+                # (a bare ladder fetch asked for a different variant and
+                # downloaded the page a second time).
+                read_doc = await self.engine.read(url)
+            else:
+                # rendered=True forces tier 2: the tool's contract IS a browser
+                # pass. Letting a cheap tier answer re-serves the exact shell the
+                # model just escalated away from (bench/span.py llm.price_check:
+                # the same Amazon shell three times, rendered budget burned).
+                res = await self.engine.ladder.fetch(
+                    url, rendered=rendered, force_tier=2 if rendered else None
+                )
         except TransientError as exc:
             # The hard-failure version of the shell lesson: every transport
             # came back empty, which is what a JS shell does to parse-only
@@ -374,15 +418,57 @@ class ToolBridge:
                     "need its content, call read_page_rendered on the same URL.]"
                 ), True
             raise
-        text = to_markdown(res.body, url)
+        links: list = []
+        if read_doc is not None:
+            text = read_doc.text or ""
+            via = read_doc.fetched_via or "engine read"
+            links = list(read_doc.meta.get("links") or [])
+        else:
+            text = to_markdown(res.body, url)
+            via = f"{res.via} (tier {res.tier})"
+            if res.rendered:
+                via += ", full-browser render"
+            if want_links:
+                from ..paging import page_links
+
+                links = page_links(res.body or "", res.final_url or url,
+                                   int(getattr(s, "read_links_max", 40) or 0))
         doc = self.seen_docs.get(url) or Doc(url=url, source="read_page")
         doc.text = text
         self.seen_docs[url] = doc
-        via = f"{res.via} (tier {res.tier})"
-        if res.rendered:
-            via += ", full-browser render"
         header = f"[{url}] fetched via {via}"
-        if len(text) > PAGE_CHAR_LIMIT:
+        out = ""
+        if paging:
+            from ..paging import focus_passages, window
+
+            focus = str(args.get("focus") or "").strip()[:200]
+            try:
+                offset = max(0, int(args.get("offset") or 0))
+            except (TypeError, ValueError):
+                offset = 0
+            if focus:
+                passages, matched = focus_passages(text, focus, PAGE_CHAR_LIMIT)
+                if matched:
+                    out = (f"{header}, {matched} paragraphs of this {len(text)}-char page "
+                           f"mention {focus!r}; the best are below, each after its "
+                           f"[@offset] (read_page with offset=N shows the text from "
+                           f"there)\n\n{passages}")
+                else:
+                    header += f", no paragraph mentions {focus!r}; showing the page instead"
+            if not out:
+                chunk, total, nxt = window(text, offset, PAGE_CHAR_LIMIT)
+                if not offset and nxt is not None:
+                    # The first page keeps the sized note every reader of this
+                    # tool already knows; the range says where the cut fell.
+                    header += (f", truncated to {PAGE_CHAR_LIMIT} of {total} chars"
+                               f" (chars 0-{len(chunk)} shown)")
+                elif offset:
+                    header += f", chars {min(offset, total)}-{min(offset, total) + len(chunk)} of {total}"
+                out = f"{header}\n\n{chunk.rstrip() if nxt is not None else chunk}"
+                if nxt is not None:
+                    out += (f"\n\n[...truncated...] call read_page with offset={nxt} to "
+                            f"continue, or with focus=\"keywords\" to jump to a topic.")
+        elif len(text) > PAGE_CHAR_LIMIT:
             out = (
                 f"{header}, truncated to {PAGE_CHAR_LIMIT} of {len(text)} chars\n\n"
                 + text[:PAGE_CHAR_LIMIT]
@@ -390,6 +476,10 @@ class ToolBridge:
             )
         else:
             out = f"{header}\n\n{text}"
+        if want_links and links:
+            shown = links[:LINKS_SHOWN]
+            out += "\n\nLinks on this page:\n" + "\n".join(
+                f"- {l['text'][:80]} -- {l['url']}" for l in shown)
         # The escalation lesson, inline: a near-empty result from the cheap
         # path is almost always a JS shell, and the fix is one tool call away.
         # Only hint when we did NOT already pay for a render -- a rendered
@@ -443,6 +533,16 @@ class ToolBridge:
                 bits.append(f"   rating {it.rating} ({it.reviews or 0} reviews)")
             if it.availability:
                 bits.append(f"   {it.availability}")
+            if it.meta.get("extraction") == "listing_row":
+                # items_vehicle_listings: what separates one car from the
+                # next is in its attributes, not its title.
+                a = it.attributes
+                facts = [a.get("mileage", ""), a.get("location", ""),
+                         f"{a['distance_mi']} mi away" if a.get("distance_mi") else "",
+                         f"packages: {a['packages']}" if a.get("packages") else "",
+                         f"history: {a['history']}" if a.get("history") else "",
+                         f"VIN {a['vin']}" if a.get("vin") else ""]
+                bits.append("   " + " · ".join(x for x in facts if x))
             if it.meta.get("offer_count"):
                 bits.append(f"   {it.meta['offer_count']} offers across sites")
             bits.append(f"   {it.url}")

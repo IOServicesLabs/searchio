@@ -788,7 +788,7 @@ def _distance(d: dict, depth: int = 3) -> str:
 
 
 #: Row parts a second copy of the same item may add to the kept one.
-_MERGE_PART = re.compile(r"distance [\d,]+|(?:\d+-Speed )?(?:Manual|Automatic|CVT)|history: .*", re.I)
+_MERGE_PART = re.compile(r"distance [\d,]+|(?:\d+-Speed )?(?:Manual|Automatic|CVT)|history: .*|pkgs: .*", re.I)
 #: A wrapper child's own suffix (``sellerDto``, ``dealerInfo``) hides what it is.
 _WRAP_SUFFIX = re.compile(r"(?:dto|info|data|details?|obj(?:ect)?)$")
 
@@ -961,6 +961,65 @@ def _histories(src: str) -> dict[str, str]:
     return out
 
 
+#: Set by with_listings for the rows it builds (a record is judged thousands
+#: of times a page; a settings lookup each time is not free).
+_LISTING_PACKAGES = [False]
+#: listing_packages: keys that hold a record's packages outright, and keys
+#: that hold a longer equipment list of which only the packages are kept.
+_PKG_KEYS = frozenset(("packages", "package", "packagesandoptions", "listingpackage", "packagenames",
+                       "optionpackages", "installedpackages"))
+_PKG_IN_KEYS = frozenset(("options", "features", "keyfeatures", "highlightedfeatures", "highlights",
+                          "installedoptions", "equipment"))
+_PKG_WORD = re.compile(r"\b(?:package|pkg|equipment group|edition)\b", re.I)
+#: A child object that holds the packages (``factoryUpgrades.packagesAndOptions``).
+_PKG_CHILD = re.compile(r"(?:upgrade|equip|option|feature|package)", re.I)
+_MAX_PKGS = 6
+
+
+def _pkg_names(v) -> list[str]:
+    """Names in a packages value: a string (comma-separated or one name), a
+    list of strings, or a list of ``{name | displayName | label}`` objects."""
+    if isinstance(v, str):
+        return [x.strip() for x in (v.split(",") if "," in v else [v]) if x.strip()]
+    out: list[str] = []
+    if isinstance(v, list):
+        for x in v[:60]:
+            if isinstance(x, str):
+                out.append(x.strip())
+            elif isinstance(x, dict):
+                name = x.get("displayName") or x.get("name") or x.get("label") or x.get("title")
+                if isinstance(name, str):
+                    out.append(name.strip())
+    return [x for x in out if x]
+
+
+def _packages(obj: dict, name: str = "", depth: int = 2) -> str:
+    """``pkgs: A; B`` for the packages a listing record names, "" when it
+    names none. A search for a package ("FX4") can only be answered from
+    here: results pages put it in the record, not in the card's title."""
+    got: list[str] = []
+    for k, v in obj.items():
+        n = _norm(k)
+        if n in _PKG_KEYS:
+            got += [x for x in _pkg_names(v) if 2 < len(x) <= 60]
+        elif n in _PKG_IN_KEYS:
+            got += [x for x in _pkg_names(v) if 2 < len(x) <= 60 and _PKG_WORD.search(x)]
+        elif depth > 1 and isinstance(v, dict) and (_ITEM_PART.search(k) or _PKG_CHILD.search(k)) \
+                and not _ASSET.search(k):
+            sub = _packages(v, name, depth - 1)
+            if sub:
+                got += sub[6:].split("; ")
+    seen: set[str] = set()
+    low = name.lower()
+    # ``$c:props:...`` is a streamed payload's reference to a value elsewhere.
+    out = [x for x in got if not x.startswith("$") and x.lower() not in low
+           and x.lower() not in seen and not seen.add(x.lower())]
+    # Named packages first: a mixed "packages and options" list may open
+    # with an engine and a paint colour.
+    out.sort(key=lambda x: not _PKG_WORD.search(x))
+    return "pkgs: " + "; ".join(out[:_MAX_PKGS]) if out else ""
+
+
 def _rec_row(obj: dict, page: str) -> tuple[str, str, bool, tuple]:
     """(row, key, named, ids) when ``obj`` looks like one listing, else ("",
     "", False, ()); ``named`` is False when the name was only assembled from
@@ -1055,9 +1114,10 @@ def _rec_row(obj: dict, page: str) -> tuple[str, str, bool, tuple]:
     except ValueError:
         dist = ""
     engine = _engine(obj, ix)
+    pkgs = _packages(obj, name) if _LISTING_PACKAGES[0] else ""
     parts = [name, price, miles, _field(obj, "transmission", idx=ix),
              engine if engine.lower() not in name.lower() else "",
-             _field(obj, "exteriorcolor", "color", idx=ix), f"VIN {vin}" if vin else "",
+             _field(obj, "exteriorcolor", "color", idx=ix), pkgs, f"VIN {vin}" if vin else "",
              " ".join(x for x in (seller, f"({where})" if where else "") if x), dist,
              _item_url(link, page) if link else ""]
     rid = () if link else tuple(v for k in _ID_KEYS if (v := _field(obj, k, exact=True, idx=ix)))
@@ -1241,6 +1301,76 @@ def _id_links(html: str, page: str, ids: dict[str, tuple]) -> dict[str, str]:
     return {k: v for k, v in out.items() if seen[v] == 1}
 
 
+_SCRIPT_BODY = re.compile(r"<script\b[^>]*>(.*?)</script>", re.S | re.I)
+_JS_STR = re.compile(r'"(?:[^"\\]|\\.)*"', re.S)
+_ESC_VIN = re.compile(r'\\"(?:vin|VIN|Vin)\\"')
+_ESC_BUDGET = 3_000_000
+
+
+_COND_WORD = re.compile(r"^(?:used|new|certified|cpo)\s+", re.I)
+
+
+def _fuller_name(name: str, other: str) -> str:
+    """``name``, or ``other`` when it is the same item named more fully
+    (a trim added); a leading condition word is kept."""
+    cond = _COND_WORD.match(name)
+    bare = name[cond.end():] if cond else name
+    obare = _COND_WORD.sub("", other)
+    if len(obare) > len(bare) and bare.lower() in obare.lower():
+        return (cond.group(0) if cond else "") + obare
+    return name
+
+
+def _escaped_records(html: str, page: str, rows: list) -> None:
+    """listing_packages: listing records inside JSON that a script carries as
+    an escaped string (a streamed app payload: ``push([1,"{\\"vin\\":...}"])``).
+    The plain scan cannot decode those, so a page built that way gave rows
+    from its JSON-LD only: no packages, often no trim. A record found here
+    adds what it knows to the row with its VIN, or becomes a row when the
+    page had none for that car."""
+    if not _ESC_VIN.search(html):
+        return
+    at = {key: n for n, (_r, key) in enumerate(rows)}
+    spent = 0
+    for sm in _SCRIPT_BODY.finditer(html):
+        body = sm.group(1)
+        if not _ESC_VIN.search(body):
+            continue
+        for lit in _JS_STR.finditer(body):
+            raw = lit.group(0)
+            if len(raw) < 400 or not _ESC_VIN.search(raw):
+                continue
+            spent += len(raw)
+            if spent > _ESC_BUDGET:
+                return
+            try:
+                plain = json.loads(raw)
+            except ValueError:
+                continue
+            found: list[tuple[str, str]] = []
+            _records_in(plain, page, found, set())
+            for row, key in found:
+                if not _VIN_ONLY.fullmatch(key):
+                    continue
+                if key in at:
+                    kept = _merge_row(rows[at[key]][0], row)
+                    name, sep, rest = kept.partition(" | ")
+                    # The payload's name may carry the trim the JSON-LD one lacks.
+                    name = _fuller_name(name, row.split(" | ", 1)[0])
+                    # A package the name already states is not repeated.
+                    parts = []
+                    for p in rest.split(" | ") if sep else []:
+                        if p.startswith("pkgs: "):
+                            left = [x for x in p[6:].split("; ") if x.lower() not in name.lower()]
+                            p = "pkgs: " + "; ".join(left) if left else ""
+                        if p:
+                            parts.append(p)
+                    rows[at[key]] = (" | ".join([name, *parts]), key)
+                elif len(rows) < _MAX_ROWS:
+                    at[key] = len(rows)
+                    rows.append((row, key))
+
+
 def _generic_rows(html: str, page: str = "") -> list[tuple[str, str]]:
     from .config import get_settings
 
@@ -1282,6 +1412,8 @@ def _generic_rows(html: str, page: str = "") -> list[tuple[str, str]]:
             rows[at[0]] = (f"{row} | {link}", key)
     if any(t in html for t in _ANCHOR_TAILS):
         _records_in(html, page, rows, done, ids)
+    if _LISTING_PACKAGES[0]:
+        _escaped_records(html, page, rows)
     if ids:
         bare = {key for row, key in rows if not row.rsplit(" | ", 1)[-1].startswith("http")}
         links = _id_links(html, page, {k: v for k, v in ids.items() if k in bare})
@@ -1340,7 +1472,7 @@ def _merge_row(kept: str, other: str) -> str:
     def kind(p: str) -> str:
         m = _MERGE_PART.fullmatch(p)
         if m:
-            return p.split()[0].lower() if p.lower().startswith(("distance", "history")) else "trans"
+            return p.split()[0].lower() if p.lower().startswith(("distance", "history", "pkgs")) else "trans"
         # A digit: "Turbo Motors" (a dealer) is no engine.
         return "engine" if _ENGINE.fullmatch(p) and re.search(r"\d", p) and not p.startswith("http") else ""
 
@@ -1352,13 +1484,15 @@ def _merge_row(kept: str, other: str) -> str:
     return " | ".join(parts + add + tail)
 
 
-def with_listings(text: str, html: str, url: str = "") -> str:
+def with_listings(text: str, html: str, url: str = "", *, packages: bool | None = None) -> str:
     """structured_listings: ``text`` plus the page's listing cards, when the
     prose extraction did not keep them. Rows already present (by VIN, else
     name) are not repeated; a page with no listing data is returned as is."""
     from .config import get_settings
 
     s = get_settings()
+    packages = bool(getattr(s, "listing_packages", False)) if packages is None else packages
+    _LISTING_PACKAGES[0] = packages
     rows: list[tuple[str, str]] = []
     if "ld+json" in html and _LISTING_HINT.search(html):
         rows += [_ld_row(n, url) for n in _walk_ld(html) if _types(n) & _LISTING_TYPES]
@@ -1382,6 +1516,11 @@ def with_listings(text: str, html: str, url: str = "") -> str:
             # around a results card does not print.
             hist = next((p for p in row.split(" | ") if p.startswith("history: ")), "")
             hist = hist if hist and f"{key} | {hist}" not in text else ""
+            if packages:
+                # listing_packages: nor its packages, which a card never prints.
+                pk = next((p for p in row.split(" | ") if p.startswith("pkgs: ")), "")
+                if pk and pk[6:].split("; ")[0] not in text:
+                    hist = f"{hist} | {pk}" if hist else pk
             if (link or hist) and (key in compact or len(compact) < _MAX_ROWS):
                 e = compact.setdefault(key, [row.split(" | ", 1)[0], "", "", ""])
                 e[1] = e[1] or (key if hist and f"VIN {key}" in row else "")
@@ -1392,7 +1531,14 @@ def with_listings(text: str, html: str, url: str = "") -> str:
         key = html_mod.unescape(html_mod.unescape(key)) if "&" in key else key
         if key in keys:
             if key in at_key:
-                out[at_key[key]] = "- " + _merge_row(out[at_key[key]][2:], row)
+                merged = _merge_row(out[at_key[key]][2:], row)
+                if packages:
+                    # The data copy may name the trim the JSON-LD copy lacks
+                    # ("2026 Ford F150 SuperCrew Cab" / "... STX Pickup 4D").
+                    name, sep, rest = merged.partition(" | ")
+                    if sep:
+                        merged = f"{_fuller_name(name, row.split(' | ', 1)[0])} | {rest}"
+                out[at_key[key]] = "- " + merged
             continue
         if generic:
             # Pages often hold each item twice (a card and a tracking
@@ -1443,14 +1589,37 @@ def with_listings(text: str, html: str, url: str = "") -> str:
     if not out:
         return text
     head = f"The page's own data reports {total:,} results in all.\n\n" if total else ""
+    if packages:
+        kw = _url_keyword(url)
+        if kw:
+            # The site applied this filter; its cards do not repeat the word.
+            head += f'The page URL filters these results by keyword "{kw}".\n\n'
     return f"{text}\n\n## Listings\n\n{head}" + "\n".join(out)
+
+
+_KEYWORD_PARAMS = frozenset(("keyword", "keywords", "keywordphrases", "keyword[]", "searchkeyword"))
+
+
+def _url_keyword(url: str) -> str:
+    """The free-text keyword filter in a listing URL's query, if any."""
+    try:
+        q = urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query)
+    except ValueError:
+        return ""
+    vals = [v.strip() for k, v in q if k.lower() in _KEYWORD_PARAMS and v.strip()]
+    return ", ".join(dict.fromkeys(vals))[:80]
 
 
 def doc_from_fetch(url: str, html: str, *, source: str = "", snippet: str = "") -> Doc:
     from .config import get_settings
 
+    s = get_settings()
     text = to_markdown(html, url)
-    if get_settings().structured_listings:
+    if getattr(s, "extract_youtube_lists", False) or getattr(s, "extract_x_posts", False):
+        from .sitedata import site_text
+
+        text = site_text(url, html, text, s)
+    if s.structured_listings:
         text = with_listings(text, html, url)
     return Doc(
         url=url,

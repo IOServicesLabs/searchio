@@ -44,6 +44,14 @@ from ..errors import SidecarUnavailable, SidecarVerbError
 #: retries (~1 s, measured), and the first tier-2 climb of every process
 #: paid that before learning nothing listens; a live sidecar accepts in <1 ms.
 _FAST_PROBE = [False]
+#: sidecar_fast_boot: poll a spawned engine's health from 10 ms, doubling to
+#: 160 ms, instead of a flat 500 ms sleep (the binary boots in milliseconds).
+_FAST_BOOT = [False]
+#: engine_proxy (set by the Ladder): proxy URL handed to a spawned engine.
+_ENGINE_PROXY = [""]
+#: Extra SE_* environment for a spawned engine (set by the Ladder); an empty
+#: value removes the variable.
+_ENGINE_ENV: dict[str, str] = {}
 
 
 async def _port_open(base: str) -> bool:
@@ -530,6 +538,15 @@ class SidecarClient:
         """
         env = child_env()
         env["SE_SERVE_PORT"] = str(self.port)
+        if _ENGINE_PROXY[0]:
+            env["SE_PROXY"] = _ENGINE_PROXY[0]  # engine_proxy: same egress as the tiers
+        else:
+            env.pop("SE_PROXY", None)
+        for k, v in _ENGINE_ENV.items():
+            if v:
+                env[k] = v
+            else:
+                env.pop(k, None)
 
         self._proc = subprocess.Popen(
             [str(binary), str(self.port)],
@@ -542,6 +559,7 @@ class SidecarClient:
         self._stderr_tail = _StderrTail(self._proc)
 
         deadline = time.monotonic() + self.boot_timeout_s
+        nap = 0.01 if _FAST_BOOT[0] else 0.5
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
                 tail = self._stderr_tail.tail()
@@ -550,9 +568,17 @@ class SidecarClient:
                     + (f": {tail}" if tail else "")
                 )
                 raise SidecarUnavailable(self._unavailable_reason)
+            if _FAST_BOOT[0]:
+                # The port check is a 0.25 s-bounded connect; the health GET
+                # only goes out once something is listening.
+                if await _port_open(expect_url) and await self._healthy(expect_url):
+                    return
+                await asyncio.sleep(nap)
+                nap = min(nap * 2, 0.16)
+                continue
             if await self._healthy(expect_url):
                 return
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(nap)
         self._unavailable_reason = f"engine did not become healthy within {self.boot_timeout_s}s"
         raise SidecarUnavailable(self._unavailable_reason)
 
@@ -762,7 +788,8 @@ class SidecarClient:
     # ── typed verbs ──────────────────────────────────────────────────────────
 
     async def fetch(self, url: str, *, tab_id: str = "default", timeout: float | None = None,
-                    timeout_ms: int | None = None, wait_until: str = "") -> dict:
+                    timeout_ms: int | None = None, wait_until: str = "",
+                    extra: dict | None = None) -> dict:
         """HTTP-first page fetch that escalates to the browser only if needed.
 
         ``timeout`` bounds the RPC call itself; ``timeout_ms`` is forwarded to
@@ -777,6 +804,8 @@ class SidecarClient:
             params["timeout_ms"] = timeout_ms
         if wait_until:
             params["wait_until"] = wait_until
+        if extra:
+            params.update(extra)  # engine-only verb options (render, binary, ...)
         return await self.call(VERB_FETCH, params, timeout=timeout)
 
     async def search(self, query: str, *, engine: str = "auto", k: int = 10,

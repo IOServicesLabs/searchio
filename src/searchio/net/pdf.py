@@ -22,6 +22,7 @@ binary fixture drifting. Production code never calls it.
 from __future__ import annotations
 
 import io
+import threading
 
 #: Re-fetches larger than this are refused, not parsed: a hostile or broken
 #: origin must not turn one PDF link into a memory event, and pypdf parse
@@ -49,6 +50,55 @@ def looks_like_pdf(data: bytes) -> bool:
     return data.startswith(b"%PDF-")
 
 
+#: pdf_fast_extract (set by the Ladder): use pypdfium2 when it is installed.
+_FAST = [False]
+#: PDFium is not thread-safe; extraction runs on the ladder's worker pool.
+_PDFIUM_LOCK = threading.Lock()
+
+
+def _extract_pdfium(data: bytes, max_pages: int, char_budget: int) -> tuple[str, int, int] | None:
+    """The same contract as :func:`extract_text` through PDFium, or None when
+    pypdfium2 is not installed (the caller then uses pypdf)."""
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    with _PDFIUM_LOCK:
+        try:
+            doc = pdfium.PdfDocument(data)
+        except Exception as exc:  # noqa: BLE001 -- PdfiumError and friends
+            raise PdfUnreadable(str(exc)[:120]) from exc
+        try:
+            total = len(doc)
+            parts: list[str] = []
+            used = got = 0
+            for i in range(min(total, max(1, int(max_pages)))):
+                page = doc[i]
+                try:
+                    tp = page.get_textpage()
+                    try:
+                        parts.append(tp.get_text_bounded() or "")
+                    finally:
+                        tp.close()
+                finally:
+                    page.close()
+                used += 1
+                got += len(parts[-1])
+                if char_budget > 0 and got >= char_budget:
+                    break
+        except PdfUnreadable:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise PdfUnreadable(str(exc)[:120]) from exc
+        finally:
+            doc.close()
+    # PDFium separates lines with CRLF (the rest of the system expects LF)
+    # and marks a word hyphenated across a line break with U+0002 in place
+    # of the hyphen and the break: dropping it rejoins the word.
+    return ("\n\n".join(p.replace("\r\n", "\n").replace("\x02", "") for p in parts),
+            used, total)
+
+
 def extract_text(
     data: bytes, max_pages: int = DEFAULT_MAX_PAGES, char_budget: int = 0
 ) -> tuple[str, int, int]:
@@ -60,6 +110,10 @@ def extract_text(
     (scanned images) returns empty text -- the ladder refuses those honestly,
     no render tier can OCR either.
     """
+    if _FAST[0]:
+        fast = _extract_pdfium(data, max_pages, char_budget)
+        if fast is not None:
+            return fast
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover -- dep is declared

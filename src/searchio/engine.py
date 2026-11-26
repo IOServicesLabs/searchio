@@ -687,16 +687,67 @@ class Engine:
                 doc.fetched_via = res.via
                 return doc
         doc = await self._extract(final, res.body)
+        if getattr(self.s, "read_links", False):
+            # read_links: extraction drops every link; hand the reader the
+            # page's own (citations, pagination, "next") so it can follow.
+            from .paging import page_links
+
+            links = page_links(res.body or "", final,
+                               int(getattr(self.s, "read_links_max", 40) or 0))
+            if links:
+                doc.meta["links"] = links
         if getattr(self.s, "youtube_watch_details", False) and len(doc.text or "") < 1000:
             from .leanread import youtube_watch_details
 
             yt = youtube_watch_details(final, res.body or "")
             if yt is not None:
                 doc.title, doc.text = yt
+        via = res.via
+        if getattr(self.s, "thin_heavy_rescue", False):
+            doc, via = await self._thin_heavy(fetched, final, res, doc)
         if getattr(self.s, "read_memo", False):
             self._memo_put(final, res.body, doc)
-        doc.fetched_via = res.via
+        doc.fetched_via = via
         return doc
+
+    async def _thin_heavy(self, fetched: str, final: str, res, doc: Doc):
+        """thin_heavy_rescue: a large 200 body that extracts to almost nothing.
+
+        The classifier measures visible text, and a script-built page's footer
+        clears its floor: a megabyte of application data reads as an "ok" page
+        of 170 characters and nothing climbs. Extraction is the first place
+        that knows the read came out empty, so the one browser pass is asked
+        for here. The longer text wins; the outcome is stamped either way so a
+        caller can tell an honest thin page from one nobody tried to render.
+        """
+        max_chars = int(getattr(self.s, "thin_heavy_max_chars", 300) or 0)
+        min_bytes = int(getattr(self.s, "thin_heavy_min_bytes", 200_000) or 0)
+        body = res.body or ""
+        chars = len((doc.text or "").strip())
+        if chars >= max_chars or len(body) < min_bytes or getattr(res, "rendered", False):
+            return doc, res.via
+        # Stamped whether or not a browser pass is allowed: "<chars>/<bytes>".
+        stamp = f"{chars}/{len(body)}"
+        doc.meta["thin_body"] = stamp
+        if getattr(res, "tier", 0) >= 2 or int(getattr(self.s, "max_tier", 2)) < 2:
+            return doc, res.via
+        try:
+            # force_tier: tier 0 called this page ok, so nothing would climb
+            # on its own and `rendered` alone never reaches the browser.
+            res2 = await self.ladder.fetch(fetched, rendered=True, use_cache=False, force_tier=2)
+            doc2 = await self._extract(res2.final_url or final, res2.body)
+        except Exception as exc:  # noqa: BLE001 -- the thin read stands
+            doc.meta["thin_heavy"] = f"rescue_failed:{type(exc).__name__}"
+            self.ladder._bump("thin_heavy_failed")
+            return doc, res.via
+        if len(doc2.text or "") > max(len(doc.text or ""), max_chars):
+            doc2.meta["thin_heavy"] = "rescued"
+            doc2.meta["thin_body"] = stamp
+            self.ladder._bump("thin_heavy_rescued")
+            return doc2, res2.via
+        doc.meta["thin_heavy"] = "still_thin"
+        self.ladder._bump("thin_heavy_still_thin")
+        return doc, res.via
 
     async def _page_fetch(self, url: str, md: bool):
         budget = int(getattr(self.s, "pdf_read_budget", 0) or 0)

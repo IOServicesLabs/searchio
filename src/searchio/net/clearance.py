@@ -88,7 +88,8 @@ CREATE TABLE IF NOT EXISTS clearance (
     cookies    TEXT NOT NULL,
     user_agent TEXT NOT NULL DEFAULT '',
     captured   REAL NOT NULL,
-    uses       INTEGER NOT NULL DEFAULT 0
+    uses       INTEGER NOT NULL DEFAULT 0,
+    expires    REAL NOT NULL DEFAULT 0
 );
 """
 
@@ -100,12 +101,26 @@ class Clearance:
     user_agent: str = ""
     captured: float = 0.0
     uses: int = 0
+    #: Earliest expiry (unix seconds) among the row's challenge cookies, or
+    #: 0 when the jar did not say (session cookie, cheap-tier harvest).
+    expires: float = 0.0
 
     def header(self) -> str:
         return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
 
-    def fresh(self, ttl_s: int = DEFAULT_TTL_S) -> bool:
-        return bool(self.cookies) and (time.time() - self.captured) < ttl_s
+    def fresh(self, ttl_s: int = DEFAULT_TTL_S, *, max_ttl_s: int = 0) -> bool:
+        """``max_ttl_s`` > 0 turns on the cookie's own expiry: the row lives
+        until ``expires`` (capped at captured + max_ttl_s) when the jar gave
+        one, and the flat ``ttl_s`` otherwise."""
+        if not self.cookies:
+            return False
+        now = time.time()
+        if max_ttl_s > 0 and self.expires > 0:
+            return now < min(self.expires, self.captured + max_ttl_s)
+        return (now - self.captured) < ttl_s
+
+    def has_challenge_cookie(self) -> bool:
+        return any(k in CLEARANCE_COOKIES for k in self.cookies)
 
 
 def relevant_cookies(jar: list[dict], domain: str) -> dict[str, str]:
@@ -134,6 +149,52 @@ def relevant_cookies(jar: list[dict], domain: str) -> dict[str, str]:
     return out
 
 
+def _cookie_domain_ok(c: dict, want: str) -> str:
+    cdom = str(c.get("domain") or "").lstrip(".").removeprefix("www.")
+    return cdom if cdom and (want == cdom or want.endswith("." + cdom)) else ""
+
+
+def cookie_expiry(jar: list[dict], domain: str) -> float:
+    """Earliest expiry among the CHALLENGE cookies ``relevant_cookies`` would
+    keep for ``domain``; 0 when none carries one (session cookies report
+    -1 / 0 / nothing, by backend)."""
+    want = domain.removeprefix("www.")
+    best = 0.0
+    for c in jar or []:
+        if str(c.get("name") or "") not in CLEARANCE_COOKIES:
+            continue
+        if not _cookie_domain_ok(c, want):
+            continue
+        try:
+            exp = float(c.get("expires") or 0)
+        except (TypeError, ValueError):
+            continue
+        if exp > 0 and (best == 0.0 or exp < best):
+            best = exp
+    return best
+
+
+def parent_scoped(jar: list[dict], domain: str) -> dict[str, dict[str, str]]:
+    """Retained cookies set on a PARENT of ``domain``, grouped by that parent
+    (``{"example.com": {"cf_clearance": "..."}}``): a browser sends those to
+    every subdomain of the parent, so the store may too."""
+    want = domain.removeprefix("www.")
+    out: dict[str, dict[str, str]] = {}
+    for c in jar or []:
+        name = str(c.get("name") or "")
+        if name not in RETAINED_COOKIES:
+            continue
+        cdom = _cookie_domain_ok(c, want)
+        # A one-label "parent" is a public suffix; a host-only cookie (no
+        # leading dot) belongs to the exact host.
+        if not cdom or cdom == want or cdom.count(".") < 1:
+            continue
+        if not str(c.get("domain") or "").startswith("."):
+            continue
+        out.setdefault(cdom, {})[name] = str(c.get("value") or "")
+    return out
+
+
 class ClearanceStore:
     """Per-domain clearance cookies, persisted across runs.
 
@@ -142,9 +203,14 @@ class ClearanceStore:
     checked for freshness before use and refreshed on the next tier-2 success.
     """
 
-    def __init__(self, path: Path, enabled: bool = True, ttl_s: int = DEFAULT_TTL_S) -> None:
+    def __init__(self, path: Path, enabled: bool = True, ttl_s: int = DEFAULT_TTL_S,
+                 *, max_ttl_s: int = 0, domain_scope: bool = False) -> None:
         self.enabled = enabled
         self.ttl_s = ttl_s
+        #: > 0 = honour each row's cookie expiry, capped at this many seconds.
+        self.max_ttl_s = max_ttl_s
+        #: Parent-scoped rows ("." + parent) answer for sibling subdomains.
+        self.domain_scope = domain_scope
         self._db: sqlite3.Connection | None = None
         self._mem: dict[str, Clearance] = {}
         #: sqlite failures degrade to the in-memory layer and are counted,
@@ -158,6 +224,9 @@ class ClearanceStore:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 db = connect_locked(str(path))  # serialized across threads (bug 154)
                 db.executescript(_SCHEMA)
+                cols = {r[1] for r in db.execute("PRAGMA table_info(clearance)").fetchall()}
+                if "expires" not in cols:  # a store written before #191
+                    db.execute("ALTER TABLE clearance ADD COLUMN expires REAL NOT NULL DEFAULT 0")
                 db.execute("PRAGMA journal_mode=WAL")
                 db.commit()
                 self._db = db
@@ -197,6 +266,10 @@ class ClearanceStore:
         try:
             captured = float(row[2] or 0)
             uses = int(row[3] or 0)
+            try:
+                expires = float(row[4] or 0)
+            except (IndexError, KeyError):
+                expires = 0.0
         except (TypeError, ValueError):
             # The never-raise guard covered sqlite errors but not the value
             # coercion (bug 153): a corrupted `captured` made get() raise
@@ -204,10 +277,28 @@ class ClearanceStore:
             # no clearance.
             return None
         return Clearance(domain, {str(k): str(v) for k, v in cookies.items()},
-                         str(row[1] or ""), captured, uses)
+                         str(row[1] or ""), captured, uses, expires)
 
     def get(self, domain: str) -> Clearance | None:
         """Return usable clearance for this domain, or None."""
+        c = self._get_exact(domain)
+        if c is not None or not self.domain_scope:
+            return c
+        for key in self._parent_keys(domain):
+            c = self._get_exact(key)
+            if c is not None:
+                return c
+        return None
+
+    @staticmethod
+    def _parent_keys(domain: str) -> list[str]:
+        """``a.b.example.com`` -> [".a.b.example.com", ".b.example.com",
+        ".example.com"]: every cookie-domain scope that covers the host."""
+        host = domain.removeprefix("www.")
+        labels = host.split(".")
+        return ["." + ".".join(labels[i:]) for i in range(0, len(labels) - 1)]
+
+    def _get_exact(self, domain: str) -> Clearance | None:
         if not self.enabled:
             return None
         c = self._mem.get(domain)
@@ -215,7 +306,7 @@ class ClearanceStore:
             row = None
             try:
                 row = self._db.execute(
-                    "SELECT cookies, user_agent, captured, uses FROM clearance WHERE domain = ?",
+                    "SELECT cookies, user_agent, captured, uses, expires FROM clearance WHERE domain = ?",
                     (domain,),
                 ).fetchone()
             except sqlite3.Error as exc:
@@ -224,21 +315,41 @@ class ClearanceStore:
                 c = self._from_row(domain, row)
             if c:
                 self._mem[domain] = c
-        if c and c.fresh(self.ttl_s):
+        if c and c.fresh(self.ttl_s, max_ttl_s=self.max_ttl_s):
             return c
         return None
 
-    def put(self, domain: str, cookies: dict[str, str], user_agent: str = "") -> None:
+    def put(self, domain: str, cookies: dict[str, str], user_agent: str = "",
+            *, expires: float = 0.0,
+            scoped: dict[str, dict[str, str]] | None = None) -> None:
+        """``expires``: the challenge cookie's own expiry (0 = unknown).
+        ``scoped``: parent-domain cookies (see :func:`parent_scoped`), banked
+        under "." + parent when the store's ``domain_scope`` is on."""
         if not self.enabled or not cookies:
             return
-        c = Clearance(domain, cookies, user_agent, time.time())
-        self._mem[domain] = c
-        self._exec(
-            "INSERT OR REPLACE INTO clearance "
-            "(domain, cookies, user_agent, captured, uses) VALUES (?,?,?,?,0)",
-            (domain, json.dumps(cookies), user_agent, c.captured), "write dropped")
+        rows = [(domain, cookies)]
+        if self.domain_scope:
+            rows += [("." + parent, ck) for parent, ck in (scoped or {}).items() if ck]
+        for key, ck in rows:
+            c = Clearance(key, ck, user_agent, time.time(), 0, float(expires or 0))
+            self._mem[key] = c
+            self._exec(
+                "INSERT OR REPLACE INTO clearance "
+                "(domain, cookies, user_agent, captured, uses, expires) VALUES (?,?,?,?,0,?)",
+                (key, json.dumps(ck), user_agent, c.captured, c.expires), "write dropped")
+
+    def _serving_key(self, domain: str) -> str:
+        """The row ``get(domain)`` answers from: the host's own, else the
+        first live parent-scoped one."""
+        if not self.domain_scope or self._get_exact(domain) is not None:
+            return domain
+        for key in self._parent_keys(domain):
+            if self._get_exact(key) is not None:
+                return key
+        return domain
 
     def record_use(self, domain: str) -> None:
+        domain = self._serving_key(domain)
         c = self._mem.get(domain)
         if c:
             c.uses += 1
@@ -256,8 +367,9 @@ class ClearanceStore:
         caller's browser rescue, while this request was in flight -- is not
         the one that failed and stays.
         """
+        domain = self._serving_key(domain)
         if older_than is not None:
-            cur = self._mem.get(domain) or self.get(domain)
+            cur = self._mem.get(domain) or self._get_exact(domain)
             if cur is not None and cur.captured >= older_than:
                 return
         self._mem.pop(domain, None)
@@ -272,7 +384,7 @@ class ClearanceStore:
             return list(self._mem.values())
         try:
             rows = self._db.execute(
-                "SELECT domain, cookies, user_agent, captured, uses FROM clearance "
+                "SELECT domain, cookies, user_agent, captured, uses, expires FROM clearance "
                 "ORDER BY captured DESC"
             ).fetchall()
         except sqlite3.Error as exc:
